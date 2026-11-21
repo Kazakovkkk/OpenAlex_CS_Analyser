@@ -1,6 +1,4 @@
 /bin/
-/go-etl
-/inspect
 *.exe
 *.dll
 *.so
