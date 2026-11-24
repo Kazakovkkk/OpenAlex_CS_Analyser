@@ -8,6 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.21
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0
 	github.com/bytedance/sonic v1.15.5
+	github.com/klauspost/compress v1.20.5
 	github.com/parquet-go/parquet-go v0.32.1
 )
 
@@ -33,7 +34,6 @@ require (
 	github.com/bytedance/sonic/loader v0.5.3 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/klauspost/compress v1.20.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/parquet-go/bitpack v1.0.3 // indirect

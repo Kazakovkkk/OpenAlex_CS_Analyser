@@ -80,6 +80,7 @@ func NewAnonymousClient(ctx context.Context, opts ...Option) (*Client, error) {
 		config.WithHTTPClient(cc.httpClient),
 		config.WithRetryMode(aws.RetryModeStandard),
 		config.WithRetryMaxAttempts(5),
+		config.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load anonymous aws config: %w", err)

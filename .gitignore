@@ -1,4 +1,4 @@
-/bin/
+bin/
 *.exe
 *.dll
 *.so
@@ -10,7 +10,7 @@
 *.parquet
 *.jsonl
 *.jsonl.gz
-/tmp/
+tmp/
 .env
 .env.local
 .DS_Store
