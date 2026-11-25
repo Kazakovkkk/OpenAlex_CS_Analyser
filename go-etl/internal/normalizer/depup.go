@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	dedupShards    = 64
-	dedupShardMask = dedupShards - 1
+	dedupShards     = 64
+	dedupShardMask  = dedupShards - 1
+	dedupShardShift = 16
 )
 
 type dedupShard struct {
@@ -33,7 +34,7 @@ func (d *WorkDeduplicator) AddIfNew(workID uint64) bool {
 	if workID == 0 {
 		return true
 	}
-	sh := &d.shards[workID&dedupShardMask]
+	sh := &d.shards[(workID>>dedupShardShift)&dedupShardMask]
 	sh.mu.Lock()
 	added := sh.bm.CheckedAdd(workID)
 	sh.mu.Unlock()

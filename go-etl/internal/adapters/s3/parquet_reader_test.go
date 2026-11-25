@@ -230,3 +230,52 @@ func TestProcessDimensionsFiles(t *testing.T) {
 		t.Fatalf("institutions result=%+v sink=%+v", iRes, noop.Stats())
 	}
 }
+
+func TestProcessWorksFileMaxRecords(t *testing.T) {
+	t.Parallel()
+
+	csTopic := &normalizer.ParquetPrimaryTopic{
+		ID:    testPtr("https://openalex.org/T12799"),
+		Score: testPtr(float32(0.9)),
+		Field: &normalizer.ParquetIDRef{ID: testPtr("https://openalex.org/fields/17")},
+	}
+	rows := make([]normalizer.ParquetWork, 0, 5)
+	for i := range 5 {
+		rows = append(rows, normalizer.ParquetWork{
+			ID:           testPtr(fmt.Sprintf("https://openalex.org/W%d", 5000+i)),
+			Title:        testPtr(fmt.Sprintf("CS Paper %d", i)),
+			IsXPAC:       testPtr(false),
+			PrimaryTopic: csTopic,
+		})
+	}
+	raw := buildParquetBytes(t, rows)
+	const key = "data/parquet/works/updated_date=2026-10-14/part_0001.parquet"
+	client, cleanup := newMockS3Client(t, map[string][]byte{key: raw})
+	defer cleanup()
+
+	entry := ManifestEntry{
+		URL:  "s3://" + DefaultBucket + "/" + key,
+		Meta: ManifestMeta{ContentLength: int64(len(raw)), RecordCount: int64(len(rows))},
+	}
+
+	opts := DefaultParquetReadOptions()
+	opts.Mode = ReadModeFullGet
+	opts.BatchSize = 2
+	opts.MaxRecords = 3 // stop mid-file, mid-page
+
+	res, err := ProcessWorksFile(context.Background(), client, entry,
+		normalizer.NewNormalizer(normalizer.NewWorkDeduplicator()),
+		sink.NewWorksBatchPool(2, 16), sink.NewNoopSink(), opts)
+	if err != nil {
+		t.Fatalf("ProcessWorksFile: %v", err)
+	}
+	if !res.Truncated {
+		t.Fatal("Truncated must be true when max_records stops the file")
+	}
+	if res.WrittenRows != 3 {
+		t.Fatalf("written = %d, want exactly 3 rows", res.WrittenRows)
+	}
+	if res.ScannedRows < res.WrittenRows {
+		t.Fatalf("scanned %d < written %d", res.ScannedRows, res.WrittenRows)
+	}
+}

@@ -3,6 +3,7 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/parquet-go/parquet-go"
 
 	"go-etl/internal/metrics"
@@ -69,10 +72,10 @@ func TestRangeReaderAtFooterCacheAndSlidingBuffer(t *testing.T) {
 	ra := NewRangeReaderAt(context.Background(), fetcher, fileSize, RangeOptions{
 		BufferSize:      bufferSize,
 		FooterCacheSize: footerSize,
+		FooterProbeSize: footerSize,
 		Metrics:         jm,
 	})
 
-	// 1) Simulate Parquet OpenFile: 8-byte magic read at tail, then 20 KiB FileMetaData read.
 	tail := make([]byte, 8)
 	if n, err := ra.ReadAt(tail, fileSize-8); err != nil || n != 8 {
 		t.Fatalf("tail ReadAt = (%d, %v), want (8, nil)", n, err)
@@ -94,7 +97,6 @@ func TestRangeReaderAtFooterCacheAndSlidingBuffer(t *testing.T) {
 		t.Fatalf("after footer reads: stats = %+v, want reqs=1 bytes=%d hits=1", st, footerSize)
 	}
 
-	// 2) Sequential 16 KiB reads across 0..64 KiB: 1 HTTP refill + 3 RAM cache hits.
 	chunk := make([]byte, 16<<10)
 	for i := range 4 {
 		off := int64(i) * (16 << 10)
@@ -110,7 +112,6 @@ func TestRangeReaderAtFooterCacheAndSlidingBuffer(t *testing.T) {
 		t.Fatalf("after 4x16KiB seq reads: stats = %+v, want reqs=2 bytes=%d hits=4", st, footerSize+bufferSize)
 	}
 
-	// 3) Boundary-straddling read (56 KiB .. 72 KiB): reuses 56..64 KiB from RAM and refills from 64 KiB (no re-download!).
 	straddleOff := int64(56 << 10)
 	if n, err := ra.ReadAt(chunk, straddleOff); err != nil || n != len(chunk) {
 		t.Fatalf("straddle ReadAt = (%d, %v)", n, err)
@@ -119,12 +120,10 @@ func TestRangeReaderAtFooterCacheAndSlidingBuffer(t *testing.T) {
 		t.Fatal("straddle bytes mismatch")
 	}
 
-	// Verify last HTTP request started cleanly at 64 KiB (not 56 KiB).
 	if lastReq := fetcher.reqs[len(fetcher.reqs)-1]; lastReq.start != 64<<10 {
 		t.Fatalf("straddle refill started at %d, want %d (0 re-downloaded bytes)", lastReq.start, 64<<10)
 	}
 
-	// Verify live JobMetrics stayed in exact sync with RangeReaderAt.
 	snap := jm.Snapshot()
 	st = ra.Stats()
 	if snap.BytesRead != st.BytesRead || snap.HTTPRequests != st.HTTPRequests {
@@ -140,7 +139,6 @@ func TestRangeReaderAtUnbufferedAndEdgeCases(t *testing.T) {
 	data := makeDeterministicBytes(fileSize)
 	fetcher := &memRangeFetcher{data: data}
 
-	// Unbuffered baseline (BufferSize=0, FooterCacheSize=0) used in Benchmark #3.
 	ra := NewRangeReaderAt(context.Background(), fetcher, fileSize, RangeOptions{
 		BufferSize:      0,
 		FooterCacheSize: 0,
@@ -301,5 +299,264 @@ func TestS3ReaderAtWithHTTPTestParquet(t *testing.T) {
 	}
 	if totalServerReqs.Load() < 2 {
 		t.Fatalf("expected retry to fire after simulated drop, totalServerReqs=%d", totalServerReqs.Load())
+	}
+}
+
+func makeFakeParquetFile(dataSize, footerSize int) []byte {
+	out := make([]byte, dataSize+footerSize+8)
+	for i := range dataSize {
+		out[i] = byte((i*17 + 3) & 0xff)
+	}
+	for i := range footerSize {
+		out[dataSize+i] = byte(0xA5)
+	}
+	binary.LittleEndian.PutUint32(out[len(out)-8:], uint32(footerSize))
+	copy(out[len(out)-4:], "PAR1")
+	return out
+}
+
+func TestRangeFooterProbe(t *testing.T) {
+	t.Parallel()
+
+	t.Run("probe covers footer: one request", func(t *testing.T) {
+		const footerSize = 64 << 10
+		data := makeFakeParquetFile(300<<10, footerSize)
+		fetcher := &memRangeFetcher{data: data}
+		ra := NewRangeReaderAt(context.Background(), fetcher, int64(len(data)), RangeOptions{
+			FooterCacheSize: 1 << 20,
+			FooterProbeSize: 128 << 10,
+		})
+
+		off := int64(len(data)) - 8 - 32<<10
+		want := 16 << 10
+		buf := make([]byte, want)
+		n, err := ra.ReadAt(buf, off)
+		if err != nil || n != want {
+			t.Fatalf("ReadAt = (%d, %v), want (%d, nil)", n, err, want)
+		}
+		if !bytes.Equal(buf, data[off:off+int64(want)]) {
+			t.Fatal("footer bytes mismatch")
+		}
+		st := ra.Stats()
+		if st.HTTPRequests != 1 || st.BytesRead != 128<<10 {
+			t.Fatalf("stats = %+v, want 1 request of 128 KiB (probe only)", st)
+		}
+	})
+
+	t.Run("footer bigger than probe: probe + exact request", func(t *testing.T) {
+		const footerSize = 200 << 10
+		data := makeFakeParquetFile(300<<10, footerSize)
+		fetcher := &memRangeFetcher{data: data}
+		ra := NewRangeReaderAt(context.Background(), fetcher, int64(len(data)), RangeOptions{
+			FooterCacheSize: 1 << 20,
+			FooterProbeSize: 128 << 10,
+		})
+
+		off := int64(len(data)) - 8 - 150<<10
+		want := 16 << 10
+		buf := make([]byte, want)
+		if n, err := ra.ReadAt(buf, off); err != nil || n != want {
+			t.Fatalf("ReadAt = (%d, %v)", n, err)
+		}
+		if !bytes.Equal(buf, data[off:off+int64(want)]) {
+			t.Fatal("footer bytes mismatch")
+		}
+		st := ra.Stats()
+		wantBytes := uint64(128<<10) + uint64(footerSize+8)
+		if st.HTTPRequests != 2 || st.BytesRead != wantBytes {
+			t.Fatalf("stats = %+v, want 2 requests / %d bytes", st, wantBytes)
+		}
+	})
+
+	t.Run("non-parquet data: blind probe fallback, still correct", func(t *testing.T) {
+		data := makeDeterministicBytes(256 << 10)
+		fetcher := &memRangeFetcher{data: data}
+		ra := NewRangeReaderAt(context.Background(), fetcher, int64(len(data)), RangeOptions{
+			FooterCacheSize: 1 << 20,
+			FooterProbeSize: 64 << 10,
+		})
+		off := int64(len(data)) - 20<<10
+		buf := make([]byte, 16<<10)
+		if n, err := ra.ReadAt(buf, off); err != nil || n != len(buf) {
+			t.Fatalf("ReadAt = (%d, %v)", n, err)
+		}
+		if !bytes.Equal(buf, data[off:off+int64(len(buf))]) {
+			t.Fatal("fallback bytes mismatch")
+		}
+	})
+}
+
+func TestRangeMatches(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		header string
+		start  int64
+		end    int64
+		want   bool
+	}{
+		{"bytes 0-1023/5000", 0, 1023, true},
+		{"Bytes 100-199/5000", 100, 199, true},
+		{"bytes 100-198/5000", 100, 199, false},
+		{"bytes 0-1023", 0, 1023, false},
+		{"bytes */5000", 0, 1023, false},
+		{"", 0, 1023, false},
+	}
+	for _, tc := range cases {
+		if got := rangeMatches(tc.header, tc.start, tc.end); got != tc.want {
+			t.Errorf("rangeMatches(%q, %d, %d) = %v, want %v", tc.header, tc.start, tc.end, got, tc.want)
+		}
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	t.Parallel()
+	mk := func(h http.Header) *smithyhttp.Response {
+		return &smithyhttp.Response{Response: &http.Response{Header: h}}
+	}
+	if d := parseRetryAfter(nil); d != 0 {
+		t.Fatalf("nil response = %v, want 0", d)
+	}
+	if d := parseRetryAfter(mk(http.Header{})); d != 0 {
+		t.Fatalf("no header = %v, want 0", d)
+	}
+	if d := parseRetryAfter(mk(http.Header{"Retry-After": {"3"}})); d != 3*time.Second {
+		t.Fatalf("Retry-After: 3 = %v, want 3s", d)
+	}
+	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
+	if d := parseRetryAfter(mk(http.Header{"Retry-After": {future}})); d <= 0 || d > 6*time.Second {
+		t.Fatalf("Retry-After date = %v, want (0, 6s]", d)
+	}
+	if d := parseRetryAfter(mk(http.Header{"Retry-After": {"bogus"}})); d != 0 {
+		t.Fatalf("bogus Retry-After = %v, want 0", d)
+	}
+}
+
+func serveTestRange(w http.ResponseWriter, r *http.Request, data []byte) {
+	rangeHdr := r.Header.Get("Range")
+	parts := strings.Split(strings.TrimPrefix(rangeHdr, "bytes="), "-")
+	start, err1 := strconv.ParseInt(parts[0], 10, 64)
+	end, err2 := strconv.ParseInt(parts[1], 10, 64)
+	if err1 != nil || err2 != nil || start < 0 || end >= int64(len(data)) || end < start {
+		http.Error(w, "invalid Range", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(data[start : end+1])
+}
+
+func newTestRangeReaderAt(t *testing.T, srv *httptest.Server, fileSize int64, opts RangeOptions) *RangeReaderAt {
+	t.Helper()
+	srvURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	hc := &http.Client{Transport: &rewriteHostTransport{target: srvURL, base: srv.Client().Transport}}
+	client, err := NewAnonymousClient(context.Background(), WithHTTPClient(hc))
+	if err != nil {
+		t.Fatalf("NewAnonymousClient: %v", err)
+	}
+	return NewS3ReaderAt(context.Background(), client, DefaultBucket, "test/obj.bin", fileSize, opts)
+}
+
+func TestS3RangeFetcherRetriesOn503(t *testing.T) {
+	t.Parallel()
+
+	data := makeDeterministicBytes(64 << 10)
+	var reqs atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := reqs.Add(1)
+		if n <= 2 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`<Error><Code>SlowDown</Code></Error>`))
+			return
+		}
+		serveTestRange(w, r, data)
+	}))
+	defer srv.Close()
+
+	ra := newTestRangeReaderAt(t, srv, int64(len(data)), RangeOptions{
+		BufferSize:      0,
+		FooterCacheSize: 0,
+		MaxRetries:      3,
+		AttemptTimeout:  2 * time.Second,
+	})
+
+	buf := make([]byte, 4<<10)
+	n, err := ra.ReadAt(buf, 0)
+	if err != nil || n != len(buf) {
+		t.Fatalf("ReadAt = (%d, %v), want (%d, nil)", n, err, len(buf))
+	}
+	if !bytes.Equal(buf, data[:len(buf)]) {
+		t.Fatal("payload mismatch")
+	}
+	if got := reqs.Load(); got != 3 {
+		t.Fatalf("server requests = %d, want 3 (2x503 + 1x206)", got)
+	}
+	if st := ra.Stats(); st.Retries != 2 || st.HTTPRequests != 1 {
+		t.Fatalf("stats = %+v, want retries=2 httpRequests=1 (logical fetch counted once)", st)
+	}
+}
+
+func TestS3RangeFetcherNoRetryOn404(t *testing.T) {
+	t.Parallel()
+
+	var reqs atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqs.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`<Error><Code>NoSuchKey</Code><Message>missing</Message></Error>`))
+	}))
+	defer srv.Close()
+
+	ra := newTestRangeReaderAt(t, srv, 4096, RangeOptions{
+		BufferSize:      0,
+		FooterCacheSize: 0,
+		MaxRetries:      3,
+		AttemptTimeout:  2 * time.Second,
+	})
+
+	buf := make([]byte, 1024)
+	if _, err := ra.ReadAt(buf, 0); err == nil {
+		t.Fatal("expected error for 404")
+	}
+	if got := reqs.Load(); got != 1 {
+		t.Fatalf("server requests = %d, want 1 (permanent error must not be retried)", got)
+	}
+}
+
+func TestS3RangeFetcherShortBodyIsRetried(t *testing.T) {
+	t.Parallel()
+
+	data := makeDeterministicBytes(32 << 10)
+	var reqs atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := reqs.Add(1)
+		if n == 1 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-1023/%d", len(data)))
+			w.Header().Set("Content-Length", "1024")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:100]) // truncated body
+			return
+		}
+		serveTestRange(w, r, data)
+	}))
+	defer srv.Close()
+
+	ra := newTestRangeReaderAt(t, srv, int64(len(data)), RangeOptions{
+		BufferSize:      0,
+		FooterCacheSize: 0,
+		MaxRetries:      3,
+		AttemptTimeout:  2 * time.Second,
+	})
+	buf := make([]byte, 4<<10)
+	if _, err := ra.ReadAt(buf, 0); err != nil {
+		t.Fatalf("ReadAt after short body: %v", err)
+	}
+	if got := reqs.Load(); got != 2 {
+		t.Fatalf("server requests = %d, want 2", got)
 	}
 }

@@ -263,7 +263,6 @@ func parseBenchIntEnv(key string, fallback int) int {
 
 // TestBenchS3FormatsAndThreshold runs Metric #3 Part A:
 // JSONL.gz vs Parquet Full GET vs Parquet Buffered Range across the file-size ladder.
-//
 // Env knobs:
 //   - BENCH_S3_SIZES_MB="2,5,15,50,150,400"  (override for quick run, e.g. "2,5,15,50")
 //   - BENCH_S3_RUNS=3                        (median of N runs; 3-5 recommended)
@@ -369,7 +368,6 @@ func TestBenchS3FormatsAndThreshold(t *testing.T) {
 
 // TestBenchS3RangeBufferSizes runs Metric #3 Part B:
 // Compares Range buffer sizes: Unbuffered (0) vs 512 KiB vs 2 MiB vs 4 MiB on one real file.
-//
 // Env knobs:
 //   - BENCH_S3_BUF_TARGET_MB=50  (default 50 MiB file; set e.g. 15 or 50)
 //   - BENCH_S3_RUNS=3            (median of N runs)

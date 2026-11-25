@@ -50,6 +50,10 @@ type ParquetReadOptions struct {
 	RangeOpts        RangeOptions
 	BatchSize        int
 	Metrics          *metrics.JobMetrics
+	// MaxRecords stops the file after this many WRITTEN rows (0 = read the whole
+	// file). It exists for the REST contract's max_records: without it a demo
+	// request "give me 100 rows from S3" would download 587 files.
+	MaxRecords int64
 }
 
 func DefaultParquetReadOptions() ParquetReadOptions {
@@ -69,9 +73,22 @@ type FileReadResult struct {
 	MatchedRows  uint64
 	WrittenRows  uint64
 	DedupDropped uint64
+	// Truncated is true when MaxRecords stopped the file before its end.
+	Truncated bool
 	BytesRead    uint64
 	HTTPRequests uint64
 	CacheHits    uint64
+	Retries      uint64
+
+	PrefetchPlanBytes int64
+	PrefetchBytes     uint64
+	PrefetchBursts    uint64
+	PrefetchGroups    uint64
+	PlanMisses        uint64
+	HasPrefetchPlan   bool
+	PrefetchWindowed  bool
+	MaxGroupBytes     int64
+	PlanError         string
 }
 
 func openParquetEntry(
@@ -79,6 +96,7 @@ func openParquetEntry(
 	client *Client,
 	entry ManifestEntry,
 	opts ParquetReadOptions,
+	model any,
 ) (*parquet.File, ReadMode, func() RangeStats, error) {
 	bucket, key, err := ParseS3URL(entry.URL)
 	if err != nil {
@@ -126,7 +144,10 @@ func openParquetEntry(
 	ra := NewS3ReaderAt(ctx, client, bucket, key, fileSize, rangeOpts)
 
 	var fileOpts []parquet.FileOption
-	fileOpts = append(fileOpts, parquet.OptimisticRead(true))
+	fileOpts = append(fileOpts,
+		parquet.OptimisticRead(true),
+		parquet.SkipPageIndex(true),
+	)
 	if rangeOpts.BufferSize > 0 {
 		colBuf := int(min(rangeOpts.BufferSize, 256<<10))
 		fileOpts = append(fileOpts, parquet.ReadBufferSize(colBuf))
@@ -136,7 +157,22 @@ func openParquetEntry(
 	if err != nil {
 		return nil, ReadModeRange, nil, fmt.Errorf("open range parquet %s: %w", entry.URL, err)
 	}
-	return pf, ReadModeRange, ra.Stats, nil
+
+	planErr := ""
+	if model != nil {
+		plan, err := BuildPrefetchPlanFor(pf.Metadata(), model)
+		if err != nil {
+			planErr = err.Error()
+		} else {
+			ra.SetPrefetchPlan(plan)
+		}
+	}
+	statsFn := func() RangeStats {
+		st := ra.Stats()
+		st.PlanError = planErr
+		return st
+	}
+	return pf, ReadModeRange, statsFn, nil
 }
 
 func ProcessWorksFile(
@@ -153,7 +189,7 @@ func ProcessWorksFile(
 		FileSize: entry.Meta.ContentLength,
 	}
 
-	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts)
+	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts, &normalizer.ParquetWork{})
 	if err != nil {
 		return res, err
 	}
@@ -197,11 +233,18 @@ func ProcessWorksFile(
 			}
 
 			var batchMatched, batchDedup uint64
+		rows:
 			for i := range n {
 				outcome := norm.AppendParquetWork(&rowBuf[i], batch)
 				switch outcome {
 				case normalizer.OutcomeAdded:
 					batchMatched++
+					// max_records is a row-level cap: stop as soon as enough rows were
+					// accepted, not after a whole 256-row page and not after the file.
+					if opts.MaxRecords > 0 && res.WrittenRows+uint64(batch.Len()) >= uint64(opts.MaxRecords) {
+						res.Truncated = true
+						break rows
+					}
 					if batch.Len() >= batchSize {
 						written, err := flushWorksBatch(ctx, outSink, batch, opts.Metrics)
 						if err != nil {
@@ -227,6 +270,19 @@ func ProcessWorksFile(
 				if batchDedup > 0 {
 					opts.Metrics.AddDedupDropped(batchDedup)
 				}
+			}
+			if res.Truncated {
+				// max_records reached: flush what we have and finish this file.
+				if batch.Len() > 0 {
+					written, err := flushWorksBatch(ctx, outSink, batch, opts.Metrics)
+					if err != nil {
+						applyRangeStats(&res, statsFn())
+						return res, err
+					}
+					res.WrittenRows += written
+				}
+				applyRangeStats(&res, statsFn())
+				return res, nil
 			}
 		}
 
@@ -282,7 +338,7 @@ func ProcessTopicsFile(
 		FileSize: entry.Meta.ContentLength,
 	}
 
-	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts)
+	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts, &normalizer.ParquetTopic{})
 	if err != nil {
 		return res, err
 	}
@@ -383,7 +439,7 @@ func ProcessInstitutionsFile(
 		FileSize: entry.Meta.ContentLength,
 	}
 
-	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts)
+	pf, usedMode, statsFn, err := openParquetEntry(ctx, client, entry, opts, &normalizer.ParquetInstitution{})
 	if err != nil {
 		return res, err
 	}
@@ -476,4 +532,13 @@ func applyRangeStats(res *FileReadResult, st RangeStats) {
 	res.BytesRead = st.BytesRead
 	res.HTTPRequests = st.HTTPRequests
 	res.CacheHits = st.CacheHits
+	res.Retries = st.Retries
+	res.PrefetchPlanBytes = st.PrefetchPlanBytes
+	res.PrefetchBytes = st.PrefetchBytes
+	res.PrefetchBursts = st.PrefetchBursts
+	res.PlanMisses = st.PlanMisses
+	res.HasPrefetchPlan = st.HasPlan
+	res.PrefetchWindowed = st.Windowed
+	res.MaxGroupBytes = st.MaxGroupBytes
+	res.PlanError = st.PlanError
 }

@@ -102,9 +102,10 @@ func newTunedHTTPClient() *http.Client {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   64,
+		MaxConnsPerHost:       16,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		DisableCompression:    true,
 	}
@@ -119,25 +120,29 @@ func (c *Client) API() *awss3.Client {
 	return c.api
 }
 
-func (c *Client) GetObject(ctx context.Context, bucket, key string) (*awss3.GetObjectOutput, error) {
+func (c *Client) GetObject(ctx context.Context, bucket, key string, optFns ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
 	if bucket == "" {
 		bucket = c.bucket
 	}
 	out, err := c.api.GetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	})
+	}, optFns...)
 	if err != nil {
 		return nil, fmt.Errorf("s3 get s3://%s/%s: %w", bucket, key, err)
 	}
 	return out, nil
 }
 
+func disableChecksumLog(o *awss3.Options) {
+	o.DisableLogOutputChecksumValidationSkipped = true
+}
+
 func (c *Client) ReadAll(ctx context.Context, bucket, key string, maxBytes int64) ([]byte, error) {
 	if bucket == "" {
 		bucket = c.bucket
 	}
-	out, err := c.GetObject(ctx, bucket, key)
+	out, err := c.GetObject(ctx, bucket, key, disableChecksumLog)
 	if err != nil {
 		return nil, err
 	}
