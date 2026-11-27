@@ -15,14 +15,11 @@ func TestWorksBatchResetAndApproxBytes(t *testing.T) {
 	d := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
 
 	b.WorkIDs = append(b.WorkIDs, 1001, 1002)
-	b.DOIs = append(b.DOIs, "10.1000/a", "")
-	b.Titles = append(b.Titles, "Fast ETL", "Zero Alloc")
-	b.Abstracts = append(b.Abstracts, "hello world", "")
+	b.WorkTypes = append(b.WorkTypes, "article", "preprint")
 	b.PubYears = append(b.PubYears, 2025, 2024)
 	b.PubDates = append(b.PubDates, b.AllocPubDate(d), nil)
 	b.FWCIs = append(b.FWCIs, b.AllocFWCI(1.5), nil)
-	b.Keywords = append(b.Keywords, []string{"go", "clickhouse"}, nil)
-	b.AuthorIDs = append(b.AuthorIDs, []uint64{10, 20}, []uint64{30})
+	b.TopicIDs = append(b.TopicIDs, []uint32{10, 20}, nil)
 
 	if b.Len() != 2 {
 		t.Fatalf("Len() = %d, want 2", b.Len())
@@ -42,11 +39,11 @@ func TestWorksBatchResetAndApproxBytes(t *testing.T) {
 	if b.Len() != 0 || b.ApproxBytes() != 0 {
 		t.Fatalf("after Reset: Len=%d, ApproxBytes=%d, want 0", b.Len(), b.ApproxBytes())
 	}
-	if cap(b.WorkIDs) != 16 || cap(b.Titles) != 16 || cap(b.fwciSlab) != 16 {
-		t.Fatalf("Reset lost slice capacity: WorkIDs=%d Titles=%d fwciSlab=%d",
-			cap(b.WorkIDs), cap(b.Titles), cap(b.fwciSlab))
+	if cap(b.WorkIDs) != 16 || cap(b.WorkTypes) != 16 || cap(b.fwciSlab) != 16 {
+		t.Fatalf("Reset lost slice capacity: WorkIDs=%d WorkTypes=%d fwciSlab=%d",
+			cap(b.WorkIDs), cap(b.WorkTypes), cap(b.fwciSlab))
 	}
-	if b.Titles[:2][0] != "" || b.PubDates[:2][0] != nil || b.Keywords[:2][0] != nil {
+	if b.WorkTypes[:2][0] != "" || b.PubDates[:2][0] != nil || b.TopicIDs[:2][0] != nil {
 		t.Fatal("Reset did not clear pointer/string references in backing arrays")
 	}
 }

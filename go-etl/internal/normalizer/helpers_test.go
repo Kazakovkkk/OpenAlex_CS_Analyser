@@ -68,24 +68,37 @@ func TestParseOpenAlexIDs(t *testing.T) {
 
 func TestDate32Parsing(t *testing.T) {
 	t.Parallel()
-	if got, ok := ParseParquetDate32(minDate32Days); !ok || got.Format("2006-01-02") != "1900-01-01" {
-		t.Fatalf("ParseParquetDate32(1900-01-01) = (%v, %v)", got, ok)
+	dateDays := func(y int, m time.Month, d int) int32 {
+		return int32(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400)
 	}
-	if got, ok := ParseParquetDate32(maxDate32Days); !ok || got.Format("2006-01-02") != "2299-12-31" {
-		t.Fatalf("ParseParquetDate32(2299-12-31) = (%v, %v)", got, ok)
+
+	for _, tc := range []struct {
+		days int32
+		want string
+	}{
+		{dateDays(1, time.January, 1), "0001-01-01"},
+		{dateDays(1400, time.January, 1), "1400-01-01"},
+		{dateDays(1900, time.January, 1), "1900-01-01"},
+		{dateDays(2299, time.December, 31), "2299-12-31"},
+		{dateDays(9999, time.December, 31), "9999-12-31"},
+	} {
+		got, ok := ParseParquetDate32(tc.days)
+		if !ok || got.Format("2006-01-02") != tc.want {
+			t.Fatalf("ParseParquetDate32(%d) = (%v, %v), want %s", tc.days, got, ok, tc.want)
+		}
 	}
-	if _, ok := ParseParquetDate32(minDate32Days - 1); ok {
-		t.Fatal("ParseParquetDate32(1899-12-31) should be rejected")
+	if _, ok := ParseParquetDate32(dateDays(0, time.January, 1)); ok {
+		t.Fatal("year 0 must be rejected")
 	}
-	if _, ok := ParseParquetDate32(-208188); ok {
-		t.Fatal("ParseParquetDate32(1400-01-01) should be rejected")
-	}
-	if _, ok := ParseParquetDate32(maxDate32Days + 1); ok {
-		t.Fatal("ParseParquetDate32(2300-01-01) should be rejected")
+	if _, ok := ParseParquetDate32(dateDays(10000, time.January, 1)); ok {
+		t.Fatal("year 10000 must be rejected")
 	}
 
 	// JSON string date tests.
-	validStrings := []string{"1900-01-01", "2024-02-29", "2026-10-14", "2026-10-14T12:00:00Z", "2299-12-31"}
+	validStrings := []string{
+		"0001-01-01", "1400-01-01", "1850-05-01", "1899-12-31", "1900-01-01",
+		"2024-02-29", "2026-10-14", "2026-10-14T12:00:00Z", "2299-12-31", "2500-01-01",
+	}
 	for _, s := range validStrings {
 		got, ok := ParseDate32String(s)
 		if !ok || got.Format("2006-01-02") != s[:10] {
@@ -96,11 +109,7 @@ func TestDate32Parsing(t *testing.T) {
 	invalidStrings := []string{
 		"",
 		"2024",
-		"1400-01-01",
-		"1850-05-01",
-		"1899-12-31",
-		"2300-01-01",
-		"2500-01-01",
+		"0000-01-01",
 		"2023-02-29",
 		"2024-04-31",
 		"2024-13-01",

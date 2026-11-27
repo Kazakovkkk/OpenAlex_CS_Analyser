@@ -73,8 +73,10 @@ type FileReadResult struct {
 	MatchedRows  uint64
 	WrittenRows  uint64
 	DedupDropped uint64
+	// RejectedRows counts structurally unusable rows of this file (MVP Task 1).
+	RejectedRows uint64
 	// Truncated is true when MaxRecords stopped the file before its end.
-	Truncated bool
+	Truncated    bool
 	BytesRead    uint64
 	HTTPRequests uint64
 	CacheHits    uint64
@@ -232,10 +234,23 @@ func ProcessWorksFile(
 				opts.Metrics.AddScanned(uint64(n))
 			}
 
-			var batchMatched, batchDedup uint64
+			var batchMatched, batchDedup, batchRejected uint64
 		rows:
 			for i := range n {
-				outcome := norm.AppendParquetWork(&rowBuf[i], batch)
+				row := &rowBuf[i]
+				// Corpus gate first (cheap), then structural validation: a
+				// non-CS record must not inflate the rejected counter.
+				if !normalizer.IsCSParquetWork(row) {
+					continue
+				}
+				if reason := norm.PrepareParquet(row); reason != "" {
+					batchRejected++
+					if opts.Metrics != nil {
+						opts.Metrics.AddRejected(string(reason))
+					}
+					continue
+				}
+				outcome := norm.AppendParquetWork(row, batch)
 				switch outcome {
 				case normalizer.OutcomeAdded:
 					batchMatched++
@@ -263,6 +278,7 @@ func ProcessWorksFile(
 
 			res.MatchedRows += batchMatched
 			res.DedupDropped += batchDedup
+			res.RejectedRows += batchRejected
 			if opts.Metrics != nil {
 				if batchMatched > 0 {
 					opts.Metrics.AddMatched(batchMatched)

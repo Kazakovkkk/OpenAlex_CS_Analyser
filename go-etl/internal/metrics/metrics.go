@@ -99,6 +99,9 @@ type Snapshot struct {
 	DedupDropped   uint64
 	BatchesWritten uint64
 
+	RejectedRecords  uint64
+	RejectedByReason map[string]uint64
+
 	BytesRead    uint64
 	WrittenBytes uint64
 
@@ -132,6 +135,10 @@ type JobMetrics struct {
 	writtenRecords atomic.Uint64
 	dedupDropped   atomic.Uint64
 	batchesWritten atomic.Uint64
+
+	rejectedRecords atomic.Uint64
+	rejectedMu      sync.Mutex
+	rejectedReasons map[string]uint64
 
 	bytesRead    atomic.Uint64
 	writtenBytes atomic.Uint64
@@ -177,6 +184,32 @@ func (m *JobMetrics) Elapsed() time.Duration {
 func (m *JobMetrics) AddScanned(n uint64)      { m.scannedRecords.Add(n) }
 func (m *JobMetrics) AddMatched(n uint64)      { m.matchedRecords.Add(n) }
 func (m *JobMetrics) AddDedupDropped(n uint64) { m.dedupDropped.Add(n) }
+
+func (m *JobMetrics) AddRejected(reason string) {
+	m.rejectedRecords.Add(1)
+	if reason == "" {
+		return
+	}
+	m.rejectedMu.Lock()
+	if m.rejectedReasons == nil {
+		m.rejectedReasons = make(map[string]uint64, 8)
+	}
+	m.rejectedReasons[reason]++
+	m.rejectedMu.Unlock()
+}
+
+func (m *JobMetrics) RejectedByReason() map[string]uint64 {
+	m.rejectedMu.Lock()
+	defer m.rejectedMu.Unlock()
+	if len(m.rejectedReasons) == 0 {
+		return nil
+	}
+	out := make(map[string]uint64, len(m.rejectedReasons))
+	for k, v := range m.rejectedReasons {
+		out[k] = v
+	}
+	return out
+}
 func (m *JobMetrics) AddBytesRead(n uint64)    { m.bytesRead.Add(n) }
 func (m *JobMetrics) AddHTTPRequests(n uint64) { m.httpRequests.Add(n) }
 func (m *JobMetrics) IncHTTPRequests()         { m.httpRequests.Add(1) }
@@ -231,28 +264,30 @@ func (m *JobMetrics) Snapshot() Snapshot {
 	lat := m.batchLatency.Snapshot()
 
 	return Snapshot{
-		ScannedRecords: scanned,
-		MatchedRecords: matched,
-		WrittenRecords: written,
-		DedupDropped:   m.dedupDropped.Load(),
-		BatchesWritten: m.batchesWritten.Load(),
-		BytesRead:      bytesRead,
-		WrittenBytes:   writtenBytes,
-		HTTPRequests:   m.httpRequests.Load(),
-		RateLimitWaits: m.rateLimitWaits.Load(),
-		APIRetries:     m.apiRetries.Load(),
-		API429Count:    m.api429Count.Load(),
-		API5xxCount:    m.api5xxCount.Load(),
-		ElapsedSec:     elapsedSec,
-		ScanRPS:        scanRPS,
-		CurrentRPS:     currentRPS,
-		ScanMBPerSec:   scanMBs,
-		IngestMBPerSec: ingestMBs,
-		AvgBatchMs:     lat.AvgMs,
-		P50BatchMs:     lat.P50Ms,
-		P95BatchMs:     lat.P95Ms,
-		P99BatchMs:     lat.P99Ms,
-		MaxBatchMs:     lat.MaxMs,
-		CurrentItem:    m.CurrentItem(),
+		ScannedRecords:   scanned,
+		MatchedRecords:   matched,
+		WrittenRecords:   written,
+		DedupDropped:     m.dedupDropped.Load(),
+		BatchesWritten:   m.batchesWritten.Load(),
+		RejectedRecords:  m.rejectedRecords.Load(),
+		RejectedByReason: m.RejectedByReason(),
+		BytesRead:        bytesRead,
+		WrittenBytes:     writtenBytes,
+		HTTPRequests:     m.httpRequests.Load(),
+		RateLimitWaits:   m.rateLimitWaits.Load(),
+		APIRetries:       m.apiRetries.Load(),
+		API429Count:      m.api429Count.Load(),
+		API5xxCount:      m.api5xxCount.Load(),
+		ElapsedSec:       elapsedSec,
+		ScanRPS:          scanRPS,
+		CurrentRPS:       currentRPS,
+		ScanMBPerSec:     scanMBs,
+		IngestMBPerSec:   ingestMBs,
+		AvgBatchMs:       lat.AvgMs,
+		P50BatchMs:       lat.P50Ms,
+		P95BatchMs:       lat.P95Ms,
+		P99BatchMs:       lat.P99Ms,
+		MaxBatchMs:       lat.MaxMs,
+		CurrentItem:      m.CurrentItem(),
 	}
 }

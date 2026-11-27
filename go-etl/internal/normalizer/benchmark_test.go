@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -118,12 +119,16 @@ func loadRealJSONLGZ(path string) (*benchDataset, error) {
 
 		var jw JSONWork
 		if err := sonic.Unmarshal(cp, &jw); err == nil {
-			if len(jw.AbstractInvertedIdx) > 0 && len(ds.abstractMaps) < minBenchRecords {
-				ds.abstractMaps = append(ds.abstractMaps, jw.AbstractInvertedIdx)
-			}
 			if IsCSJSONWork(&jw) && len(ds.csWorks) < minBenchRecords {
 				ds.csWorks = append(ds.csWorks, jw)
 			}
+		}
+		var abs struct {
+			AbstractInvertedIndex map[string][]int `json:"abstract_inverted_index"`
+		}
+		if err := sonic.Unmarshal(cp, &abs); err == nil &&
+			len(abs.AbstractInvertedIndex) > 0 && len(ds.abstractMaps) < minBenchRecords {
+			ds.abstractMaps = append(ds.abstractMaps, abs.AbstractInvertedIndex)
 		}
 	}
 	if err := reader.Err(); err != nil {
@@ -158,11 +163,9 @@ func buildSyntheticDataset(n int) *benchDataset {
 		isCS := i%25 == 0
 		fieldID := "https://openalex.org/fields/23"
 		topicID := "https://openalex.org/T10089"
-		subfieldID := "https://openalex.org/subfields/2303"
 		if isCS {
 			fieldID = "https://openalex.org/fields/17"
 			topicID = "https://openalex.org/T12799"
-			subfieldID = "https://openalex.org/subfields/1710"
 		}
 
 		inv := make(map[string][]int, 32)
@@ -174,61 +177,27 @@ func buildSyntheticDataset(n int) *benchDataset {
 
 		fwci := 1.25 + float64(i%10)*0.3
 		jw := JSONWork{
-			ID:                   fmt.Sprintf("https://openalex.org/W%d", 2700000000+i),
-			DOI:                  fmt.Sprintf("https://doi.org/10.1000/oa.%d", i),
-			Title:                fmt.Sprintf("Scalable Analysis of Emerging Directions #%d", i),
-			PublicationYear:      int32(2015 + i%12),
-			PublicationDate:      fmt.Sprintf("%04d-06-%02d", 2015+i%12, 1+i%28),
-			CreatedDate:          "2025-10-10T00:00:00Z",
-			UpdatedDate:          "2026-10-14T06:19:08.300824Z",
-			Type:                 "article",
-			Language:             "en",
-			IsRetracted:          false,
-			IsXPAC:               false,
-			CitedByCount:         int32(i % 500),
-			ReferencedWorksCount: int32(20 + i%40),
-			AuthorsCount:         2,
-			FWCI:                 &fwci,
+			ID:              fmt.Sprintf("https://openalex.org/W%d", 2700000000+i),
+			PublicationYear: int32(2015 + i%12),
+			PublicationDate: fmt.Sprintf("%04d-06-%02d", 2015+i%12, 1+i%28),
+			UpdatedDate:     "2026-10-14T06:19:08.300824Z",
+			Type:            "article",
+			IsRetracted:     ptr(false),
+			IsXPAC:          false,
+			FWCI:            &fwci,
 			PrimaryTopic: &JSONPrimaryTopic{
-				ID:       topicID,
-				Score:    0.85,
-				Subfield: &JSONIDRef{ID: subfieldID},
-				Field:    &JSONIDRef{ID: fieldID},
-				Domain:   &JSONIDRef{ID: "https://openalex.org/domains/3"},
+				ID:    topicID,
+				Field: &JSONIDRef{ID: fieldID},
 			},
 			PrimaryLocation: &JSONPrimaryLoc{
 				Source: &JSONPrimarySource{ID: "https://openalex.org/S4306402476", Type: "journal"},
-				IsOA:   i%2 == 0,
-			},
-			Authorships: []JSONAuthorship{
-				{
-					Author:         &JSONIDRef{ID: fmt.Sprintf("https://openalex.org/A%d", 1000+i)},
-					AuthorPosition: "first",
-					Countries:      []string{"US"},
-					Institutions:   []JSONWorkInstitution{{ID: "https://openalex.org/I100", CountryCode: "US"}},
-				},
-				{
-					Author:         &JSONIDRef{ID: fmt.Sprintf("https://openalex.org/A%d", 2000+i)},
-					AuthorPosition: "last",
-					Countries:      []string{"DE"},
-					Institutions:   []JSONWorkInstitution{{ID: "https://openalex.org/I200", CountryCode: "DE"}},
-				},
 			},
 			Topics: []JSONWorkTopic{
 				{ID: topicID, Score: 0.85},
 				{ID: "https://openalex.org/T10616", Score: 0.31},
 			},
-			Keywords: []JSONWorkKeyword{
-				{DisplayName: "Machine Learning"},
-				{DisplayName: "Big Data"},
-				{DisplayName: "ClickHouse"},
-			},
-			CountsByYear: []JSONYearCount{
-				{Year: 2025, CitedByCount: 15},
-				{Year: 2024, CitedByCount: 9},
-			},
-			AbstractInvertedIdx: inv,
 		}
+		_ = inv
 
 		raw, _ := sonic.Marshal(&jw)
 		ds.workJSONs = append(ds.workJSONs, raw)
@@ -248,9 +217,7 @@ func buildSyntheticDataset(n int) *benchDataset {
 	return ds
 }
 
-// finalizeDataset ensures every pair processes at least 10,000 items and precomputes exact byte totals.
 func finalizeDataset(ds *benchDataset) {
-	// Pad slices by cycling existing real records if a real partition had fewer than 10k abstracts/CS works.
 	for len(ds.workJSONs) < minBenchRecords {
 		src := ds.workJSONs[len(ds.workJSONs)%max(len(ds.workJSONs), 1)]
 		ds.workJSONs = append(ds.workJSONs, src)
@@ -288,14 +255,11 @@ func finalizeDataset(ds *benchDataset) {
 	ds.batchApproxBytes = tmpBatch.ApproxBytes()
 }
 
-// --- Naive "Before" implementations for Pair 3 and Pair 4 ---
-
 type wordPos struct {
 	pos  int
 	word string
 }
 
-// reconstructAbstractNaive is the O(N log N) baseline without sync.Pool or strings.Builder.Grow.
 func reconstructAbstractNaive(inv map[string][]int) string {
 	if len(inv) == 0 {
 		return ""
@@ -329,40 +293,20 @@ func reconstructAbstractNaive(inv map[string][]int) string {
 	return out
 }
 
-// aosWork represents the naive Array-of-Structs (AoS) layout with per-row heap pointers and no sync.Pool.
 type aosWork struct {
-	WorkID             uint64
-	DOI                string
-	Title              string
-	Abstract           string
-	PubYear            uint16
-	PubDate            *time.Time
-	CreatedDate        time.Time
-	UpdatedDate        time.Time
-	WorkType           string
-	Language           string
-	IsRetracted        uint8
-	CitedByCount       uint32
-	RefWorksCount      uint32
-	AuthorsCount       uint16
-	FWCI               *float32
-	PrimaryTopicID     uint32
-	PrimaryTopicScore  float32
-	PrimarySubfieldID  uint32
-	PrimaryFieldID     uint16
-	PrimaryDomainID    uint8
-	PrimarySourceID    uint64
-	PrimarySourceType  string
-	PrimaryIsOA        uint8
-	FirstAuthorCountry string
-	CountryCodes       []string
-	AuthorIDs          []uint64
-	InstitutionIDs     []uint64
-	TopicIDs           []uint32
-	TopicScores        []float32
-	Keywords           []string
-	CitedByYears       []uint16
-	CitedByYearCounts  []uint32
+	WorkID            uint64
+	PubYear           uint16
+	PubDate           *time.Time
+	UpdatedDate       time.Time
+	WorkType          string
+	IsRetracted       uint8
+	FWCI              *float32
+	PrimaryTopicID    uint32
+	PrimaryFieldID    uint16
+	PrimarySourceID   uint64
+	PrimarySourceType string
+	TopicIDs          []uint32
+	TopicScores       []float32
 }
 
 func appendAoSWork(w *JSONWork, dst []aosWork) []aosWork {
@@ -376,77 +320,42 @@ func appendAoSWork(w *JSONWork, dst []aosWork) []aosWork {
 		pubDatePtr = dt
 	}
 	var fwciPtr *float32
-	if w.FWCI != nil {
+	if w.FWCI != nil && !math.IsNaN(*w.FWCI) && !math.IsInf(*w.FWCI, 0) {
 		f := new(float32)
 		*f = float32(*w.FWCI)
 		fwciPtr = f
 	}
-	firstCountry, countries, authorIDs, instIDs := extractJSONAuthorships(w.Authorships)
 	topicIDs, topicScores := extractJSONTopics(w.Topics)
-	keywords := extractJSONKeywords(w.Keywords)
-	citedYears, citedCounts := extractJSONCountsByYear(w.CountsByYear)
 
-	var pTopicID, pSubfieldID uint32
-	var pTopicScore float32
+	var pTopicID uint32
 	var pFieldID uint16
-	var pDomainID uint8
 	if pt := w.PrimaryTopic; pt != nil {
 		pTopicID = ParseTopicID(pt.ID)
-		pTopicScore = pt.Score
-		if pt.Subfield != nil {
-			pSubfieldID = ParseSubfieldID(pt.Subfield.ID)
-		}
 		if pt.Field != nil {
 			pFieldID = ParseFieldID(pt.Field.ID)
-		}
-		if pt.Domain != nil {
-			pDomainID = ParseDomainID(pt.Domain.ID)
 		}
 	}
 	var pSourceID uint64
 	var pSourceType string
-	var pIsOA uint8
-	if pl := w.PrimaryLocation; pl != nil {
-		pIsOA = boolToUint8(pl.IsOA)
-		if pl.Source != nil {
-			pSourceID = ParseSourceID(pl.Source.ID)
-			pSourceType = pl.Source.Type
-		}
+	if pl := w.PrimaryLocation; pl != nil && pl.Source != nil {
+		pSourceID = ParseSourceID(pl.Source.ID)
+		pSourceType = pl.Source.Type
 	}
 
 	return append(dst, aosWork{
-		WorkID:             ParseWorkID(w.ID),
-		DOI:                w.DOI,
-		Title:              w.Title,
-		Abstract:           ReconstructAbstract(w.AbstractInvertedIdx),
-		PubYear:            ClampUint16(w.PublicationYear),
-		PubDate:            pubDatePtr,
-		CreatedDate:        ParseTimestampString(w.CreatedDate),
-		UpdatedDate:        ParseTimestampString(w.UpdatedDate),
-		WorkType:           w.Type,
-		Language:           w.Language,
-		IsRetracted:        boolToUint8(w.IsRetracted),
-		CitedByCount:       ClampUint32(w.CitedByCount),
-		RefWorksCount:      ClampUint32(w.ReferencedWorksCount),
-		AuthorsCount:       ClampUint16(w.AuthorsCount),
-		FWCI:               fwciPtr,
-		PrimaryTopicID:     pTopicID,
-		PrimaryTopicScore:  pTopicScore,
-		PrimarySubfieldID:  pSubfieldID,
-		PrimaryFieldID:     pFieldID,
-		PrimaryDomainID:    pDomainID,
-		PrimarySourceID:    pSourceID,
-		PrimarySourceType:  pSourceType,
-		PrimaryIsOA:        pIsOA,
-		FirstAuthorCountry: firstCountry,
-		CountryCodes:       countries,
-		AuthorIDs:          authorIDs,
-		InstitutionIDs:     instIDs,
-		TopicIDs:           topicIDs,
-		TopicScores:        topicScores,
-		Keywords:           keywords,
-		CitedByYears:       citedYears,
-		CitedByYearCounts:  citedCounts,
+		WorkID:            ParseWorkID(w.ID),
+		PubYear:           ClampUint16(w.PublicationYear),
+		PubDate:           pubDatePtr,
+		UpdatedDate:       ParseTimestampString(w.UpdatedDate),
+		WorkType:          w.Type,
+		IsRetracted:       boolToUint8(derefBool(w.IsRetracted)),
+		FWCI:              fwciPtr,
+		PrimaryTopicID:    pTopicID,
+		PrimaryFieldID:    pFieldID,
+		PrimarySourceID:   pSourceID,
+		PrimarySourceType: pSourceType,
+		TopicIDs:          topicIDs,
+		TopicScores:       topicScores,
 	})
 }
 
@@ -471,8 +380,6 @@ func TestNaiveAndFastAbstractParity(t *testing.T) {
 		t.Fatalf("naive=%q != fast=%q", gotNaive, gotFast)
 	}
 }
-
-// --- Metric #4: Paired Microbenchmarks (Before vs After on 10,000+ records) ---
 
 func BenchmarkPair1_JSONUnmarshal(b *testing.B) {
 	ds := getBenchDataset(b)

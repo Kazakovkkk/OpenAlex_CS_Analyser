@@ -9,56 +9,40 @@ const (
 	DefaultBatchCap     = 10_000  // matches default batch_size in spec
 	DefaultMaxPooledCap = 100_000 // matches max batch_size in Benchmark #5
 
-	// Logical uncompressed fixed-width bytes per row (matches ClickHouse column widths):
-	// WorkID(8) + PubYear(2) + PubDate(4) + Created(8) + Updated(8) + IsRetracted(1) +
-	// CitedBy(4) + RefWorks(4) + Authors(2) + FWCI(4) + PrimaryTopicID(4) + PrimaryTopicScore(4) +
-	// PrimarySubfieldID(4) + PrimaryFieldID(2) + PrimaryDomainID(1) + PrimarySourceID(8) + PrimaryIsOA(1) = 69 B.
-	worksFixedBytesPerRow = 8 + 2 + 4 + 8 + 8 + 1 + 4 + 4 + 2 + 4 + 4 + 4 + 4 + 2 + 1 + 8 + 1
+	// Logical uncompressed fixed-width bytes per row, matching the ClickHouse
+	// column widths of openalex.works (MVP schema): work_id(8) +
+	// source_updated_at(8) + primary_field_id(2) + is_retracted(1) +
+	// publication_year(2) + publication_date(4) + primary_topic_id(4) +
+	// primary_source_id(8) + fwci(8) + has_fwci(1) = 46 B.
+	worksFixedBytesPerRow = 8 + 8 + 2 + 1 + 2 + 4 + 4 + 8 + 8 + 1
 
-	// TopicID(4) + SubfieldID(4) + FieldID(2) + DomainID(1) + WorksCount(4) + CitedByCount(4) + UpdatedDate(8) = 27 B.
-	topicsFixedBytesPerRow = 4 + 4 + 2 + 1 + 4 + 4 + 8
+	// Topics: topic_id(4) + subfield_id(2) + works_count(4) + cited_by_count(4) + updated(8).
+	topicsFixedBytesPerRow = 4 + 2 + 4 + 4 + 8
 
-	// InstitutionID(8) + Lat(8) + Lon(8) + WorksCount(4) + CitedByCount(4) + HIndex(4) + UpdatedDate(8) = 44 B.
+	// Institutions (diagnostics only for now): id(8) + lat(8) + lon(8) +
+	// works(4) + cited(4) + h(4) + updated(8).
 	institutionsFixedBytesPerRow = 8 + 8 + 8 + 4 + 4 + 4 + 8
 )
 
 type WorksBatch struct {
-	WorkIDs   []uint64
-	DOIs      []string
-	Titles    []string
-	Abstracts []string
+	WorkIDs []uint64
 
-	PubYears     []uint16
-	PubDates     []*time.Time
-	CreatedDates []time.Time
 	UpdatedDates []time.Time
+	WorkTypes    []string
 
-	WorkTypes      []string
-	Languages      []string
-	IsRetracted    []uint8
-	CitedByCounts  []uint32
-	RefWorksCounts []uint32
-	AuthorsCounts  []uint16
-	FWCIs          []*float32
+	PrimaryFieldIDs []uint16
+	IsRetracted     []uint8
+	PubYears        []uint16
+
+	PubDates []*time.Time
 
 	PrimaryTopicIDs    []uint32
-	PrimaryTopicScores []float32
-	PrimarySubfieldIDs []uint32
-	PrimaryFieldIDs    []uint16
-	PrimaryDomainIDs   []uint8
+	TopicIDs           [][]uint32
+	TopicScores        [][]float32
 	PrimarySourceIDs   []uint64
 	PrimarySourceTypes []string
-	PrimaryIsOA        []uint8
 
-	FirstAuthorCountries []string
-	CountryCodes         [][]string
-	AuthorIDs            [][]uint64
-	InstitutionIDs       [][]uint64
-	TopicIDs             [][]uint32
-	TopicScores          [][]float32
-	Keywords             [][]string
-	CitedByYears         [][]uint16
-	CitedByYearCounts    [][]uint32
+	FWCIs []*float32
 
 	pubDateSlab []time.Time
 	fwciSlab    []float32
@@ -69,40 +53,21 @@ func NewWorksBatch(capacity int) *WorksBatch {
 		capacity = DefaultBatchCap
 	}
 	return &WorksBatch{
-		WorkIDs:              make([]uint64, 0, capacity),
-		DOIs:                 make([]string, 0, capacity),
-		Titles:               make([]string, 0, capacity),
-		Abstracts:            make([]string, 0, capacity),
-		PubYears:             make([]uint16, 0, capacity),
-		PubDates:             make([]*time.Time, 0, capacity),
-		CreatedDates:         make([]time.Time, 0, capacity),
-		UpdatedDates:         make([]time.Time, 0, capacity),
-		WorkTypes:            make([]string, 0, capacity),
-		Languages:            make([]string, 0, capacity),
-		IsRetracted:          make([]uint8, 0, capacity),
-		CitedByCounts:        make([]uint32, 0, capacity),
-		RefWorksCounts:       make([]uint32, 0, capacity),
-		AuthorsCounts:        make([]uint16, 0, capacity),
-		FWCIs:                make([]*float32, 0, capacity),
-		PrimaryTopicIDs:      make([]uint32, 0, capacity),
-		PrimaryTopicScores:   make([]float32, 0, capacity),
-		PrimarySubfieldIDs:   make([]uint32, 0, capacity),
-		PrimaryFieldIDs:      make([]uint16, 0, capacity),
-		PrimaryDomainIDs:     make([]uint8, 0, capacity),
-		PrimarySourceIDs:     make([]uint64, 0, capacity),
-		PrimarySourceTypes:   make([]string, 0, capacity),
-		PrimaryIsOA:          make([]uint8, 0, capacity),
-		FirstAuthorCountries: make([]string, 0, capacity),
-		CountryCodes:         make([][]string, 0, capacity),
-		AuthorIDs:            make([][]uint64, 0, capacity),
-		InstitutionIDs:       make([][]uint64, 0, capacity),
-		TopicIDs:             make([][]uint32, 0, capacity),
-		TopicScores:          make([][]float32, 0, capacity),
-		Keywords:             make([][]string, 0, capacity),
-		CitedByYears:         make([][]uint16, 0, capacity),
-		CitedByYearCounts:    make([][]uint32, 0, capacity),
-		pubDateSlab:          make([]time.Time, 0, capacity),
-		fwciSlab:             make([]float32, 0, capacity),
+		WorkIDs:            make([]uint64, 0, capacity),
+		UpdatedDates:       make([]time.Time, 0, capacity),
+		WorkTypes:          make([]string, 0, capacity),
+		PrimaryFieldIDs:    make([]uint16, 0, capacity),
+		IsRetracted:        make([]uint8, 0, capacity),
+		PubYears:           make([]uint16, 0, capacity),
+		PubDates:           make([]*time.Time, 0, capacity),
+		PrimaryTopicIDs:    make([]uint32, 0, capacity),
+		TopicIDs:           make([][]uint32, 0, capacity),
+		TopicScores:        make([][]float32, 0, capacity),
+		PrimarySourceIDs:   make([]uint64, 0, capacity),
+		PrimarySourceTypes: make([]string, 0, capacity),
+		FWCIs:              make([]*float32, 0, capacity),
+		pubDateSlab:        make([]time.Time, 0, capacity),
+		fwciSlab:           make([]float32, 0, capacity),
 	}
 }
 
@@ -124,41 +89,21 @@ func (b *WorksBatch) Len() int {
 
 func (b *WorksBatch) Reset() {
 	b.WorkIDs = b.WorkIDs[:0]
-	b.DOIs = resetWithClear(b.DOIs)
-	b.Titles = resetWithClear(b.Titles)
-	b.Abstracts = resetWithClear(b.Abstracts)
+	b.UpdatedDates = b.UpdatedDates[:0]
+	b.WorkTypes = resetWithClear(b.WorkTypes)
 
+	b.PrimaryFieldIDs = b.PrimaryFieldIDs[:0]
+	b.IsRetracted = b.IsRetracted[:0]
 	b.PubYears = b.PubYears[:0]
 	b.PubDates = resetWithClear(b.PubDates)
-	b.CreatedDates = b.CreatedDates[:0]
-	b.UpdatedDates = b.UpdatedDates[:0]
-
-	b.WorkTypes = resetWithClear(b.WorkTypes)
-	b.Languages = resetWithClear(b.Languages)
-	b.IsRetracted = b.IsRetracted[:0]
-	b.CitedByCounts = b.CitedByCounts[:0]
-	b.RefWorksCounts = b.RefWorksCounts[:0]
-	b.AuthorsCounts = b.AuthorsCounts[:0]
-	b.FWCIs = resetWithClear(b.FWCIs)
 
 	b.PrimaryTopicIDs = b.PrimaryTopicIDs[:0]
-	b.PrimaryTopicScores = b.PrimaryTopicScores[:0]
-	b.PrimarySubfieldIDs = b.PrimarySubfieldIDs[:0]
-	b.PrimaryFieldIDs = b.PrimaryFieldIDs[:0]
-	b.PrimaryDomainIDs = b.PrimaryDomainIDs[:0]
-	b.PrimarySourceIDs = b.PrimarySourceIDs[:0]
-	b.PrimarySourceTypes = resetWithClear(b.PrimarySourceTypes)
-	b.PrimaryIsOA = b.PrimaryIsOA[:0]
-
-	b.FirstAuthorCountries = resetWithClear(b.FirstAuthorCountries)
-	b.CountryCodes = resetWithClear(b.CountryCodes)
-	b.AuthorIDs = resetWithClear(b.AuthorIDs)
-	b.InstitutionIDs = resetWithClear(b.InstitutionIDs)
 	b.TopicIDs = resetWithClear(b.TopicIDs)
 	b.TopicScores = resetWithClear(b.TopicScores)
-	b.Keywords = resetWithClear(b.Keywords)
-	b.CitedByYears = resetWithClear(b.CitedByYears)
-	b.CitedByYearCounts = resetWithClear(b.CitedByYearCounts)
+	b.PrimarySourceIDs = b.PrimarySourceIDs[:0]
+	b.PrimarySourceTypes = resetWithClear(b.PrimarySourceTypes)
+
+	b.FWCIs = resetWithClear(b.FWCIs)
 
 	b.pubDateSlab = b.pubDateSlab[:0]
 	b.fwciSlab = b.fwciSlab[:0]
@@ -170,28 +115,10 @@ func (b *WorksBatch) ApproxBytes() int64 {
 		return 0
 	}
 	total := int64(n) * worksFixedBytesPerRow
-	total += sumStringBytes(b.DOIs) + sumStringBytes(b.Titles) + sumStringBytes(b.Abstracts)
-	total += sumStringBytes(b.WorkTypes) + sumStringBytes(b.Languages)
-	total += sumStringBytes(b.PrimarySourceTypes) + sumStringBytes(b.FirstAuthorCountries)
-	total += sumNestedStringBytes(b.CountryCodes) + sumNestedStringBytes(b.Keywords)
-	for _, s := range b.AuthorIDs {
-		total += int64(len(s)) * 8
-	}
-	for _, s := range b.InstitutionIDs {
-		total += int64(len(s)) * 8
-	}
-	for _, s := range b.TopicIDs {
-		total += int64(len(s)) * 4
-	}
-	for _, s := range b.TopicScores {
-		total += int64(len(s)) * 4
-	}
-	for _, s := range b.CitedByYears {
-		total += int64(len(s)) * 2
-	}
-	for _, s := range b.CitedByYearCounts {
-		total += int64(len(s)) * 4
-	}
+	total += sumStringBytes(b.WorkTypes)
+	total += sumStringBytes(b.PrimarySourceTypes)
+	total += sumNestedUint32Bytes(b.TopicIDs)
+	total += sumNestedFloat32Bytes(b.TopicScores)
 	return total
 }
 
@@ -245,12 +172,18 @@ func sumStringBytes(ss []string) int64 {
 	return total
 }
 
-func sumNestedStringBytes(groups [][]string) int64 {
+func sumNestedUint32Bytes(groups [][]uint32) int64 {
 	var total int64
 	for _, g := range groups {
-		for _, s := range g {
-			total += int64(len(s))
-		}
+		total += int64(len(g)) * 4
+	}
+	return total
+}
+
+func sumNestedFloat32Bytes(groups [][]float32) int64 {
+	var total int64
+	for _, g := range groups {
+		total += int64(len(g)) * 4
 	}
 	return total
 }

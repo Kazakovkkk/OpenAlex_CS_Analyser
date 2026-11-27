@@ -84,9 +84,6 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 	if err != nil {
 		return fmt.Errorf("app: fetch works manifest: %w", err)
 	}
-	// Select without the file limit first: max_files must be applied AFTER the date
-	// filter, otherwise "from_date" would only see the oldest partitions of the
-	// manifest (the first N entries) and drop them all.
 	entries, err := manifest.SelectEntries(req.ShardIndex, req.ShardTotal, 0)
 	if err != nil {
 		return fmt.Errorf("app: select files: %w", err)
@@ -119,7 +116,7 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 
 	proc := &ingest.S3WorksProcessor{
 		Client:      a.cfg.S3,
-		Normalizer:  normalizer.NewNormalizer(normalizer.NewWorkDeduplicator()),
+		Normalizer:  normalizer.NewNormalizer(normalizer.NewWorkDeduplicator(), normalizer.WithSnapshotYear(manifestYear(manifest.Date))),
 		Pool:        sink.NewWorksBatchPool(batchSize, sink.DefaultMaxPooledCap),
 		Sink:        a.cfg.Sink,
 		Metrics:     j.Metrics(),
@@ -130,10 +127,6 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 	if workers <= 0 {
 		workers = a.cfg.DefaultWorkers
 	}
-	// The checkpoint name must describe the selection, not the job id: job ids
-	// restart at ing-1 with every process, so an id-based name silently reuses the
-	// previous run's checkpoint and the new job "completes" without doing any work
-	// (exactly what happened during the live HTTP smoke test).
 	ckPath := ""
 	if a.cfg.CheckpointDir != "" {
 		ckPath = filepath.Join(a.cfg.CheckpointDir, fmt.Sprintf(
@@ -162,8 +155,6 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 		return fmt.Errorf("app: all %d files failed (like the first: %v)", res.FilesFailed, res.FailedFiles[0].Err)
 	}
 	if res.FilesDone == 0 && res.FilesSkipped > 0 {
-		// Do not report "completed" for a run that did nothing: the operator must
-		// know the checkpoint swallowed the selection.
 		return fmt.Errorf("app: all %d selected file(s) were already processed according to checkpoint %q; "+
 			"delete that file (or change max_files/shard) to run them again", res.FilesSkipped, ckPath)
 	}
@@ -203,7 +194,7 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 	if batchSize <= 0 {
 		batchSize = a.cfg.DefaultBatchSize
 	}
-	norm := normalizer.NewNormalizer(normalizer.NewWorkDeduplicator())
+	norm := normalizer.NewNormalizer(normalizer.NewWorkDeduplicator(), normalizer.WithSnapshotYear(time.Now().UTC().Year()))
 	pool := sink.NewWorksBatchPool(batchSize, sink.DefaultMaxPooledCap)
 	batch := pool.Get()
 	defer pool.Put(batch)
@@ -224,11 +215,10 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 
 	stats, err := client.IterateWorks(ctx, query, func(raw []byte) error {
 		j.Metrics().AddScanned(1)
-		outcome, aerr := norm.AppendRawJSONWork(raw, batch)
-		if aerr != nil {
-			return nil
-		}
+		outcome, reason := norm.IngestRawJSON(raw, batch)
 		switch outcome {
+		case normalizer.OutcomeRejected:
+			j.Metrics().AddRejected(string(reason))
 		case normalizer.OutcomeAdded:
 			j.Metrics().AddMatched(1)
 		case normalizer.OutcomeDuplicate:
@@ -243,8 +233,6 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 	if ferr := flush(); ferr != nil && err == nil {
 		err = ferr
 	}
-	// The API adapter keeps its own counters; the /jobs snapshot reads JobMetrics,
-	// so without this the API jobs reported bytes_read=0, http_requests=0.
 	if stats.Bytes > 0 {
 		j.Metrics().AddBytesRead(stats.Bytes)
 	}
@@ -267,8 +255,16 @@ func (a *App) logIngestResult(j *jobs.Job, res ingest.Result) {
 		"job", j.ID(),
 		"files_done", res.FilesDone, "files_failed", res.FilesFailed, "files_skipped", res.FilesSkipped,
 		"scanned", res.Scanned, "matched", res.Matched, "written", res.Written,
+		"rejected", res.Rejected, "reasons", j.Metrics().RejectedByReason(),
 		"bytes_read", res.BytesRead, "http_requests", res.HTTPRequests,
 		"stopped", res.Stopped, "elapsed", res.Elapsed.Round(time.Millisecond))
+}
+
+func manifestYear(date string) int {
+	if t, err := time.Parse("2006-01-02", strings.TrimSpace(date)); err == nil {
+		return t.Year()
+	}
+	return time.Now().UTC().Year()
 }
 
 func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.DimensionsRequest) error {

@@ -1,4 +1,4 @@
-﻿package loadtest
+package loadtest
 
 import (
 	"bufio"
@@ -72,6 +72,7 @@ type Result struct {
 	Matched      uint64
 	Written      uint64
 	DedupDropped uint64
+	Rejected     uint64
 	Elapsed      time.Duration
 	ActualRPS    float64
 	P50BatchMs   float64
@@ -152,7 +153,7 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 		DurationSec: cfg.DurationSec,
 	}
 
-	norm := normalizer.NewNormalizer(nil)
+	norm := normalizer.NewNormalizer(nil, normalizer.WithSnapshotYear(time.Now().UTC().Year()))
 	pool := sink.NewWorksBatchPool(cfg.BatchSize, max(cfg.BatchSize, sink.DefaultMaxPooledCap))
 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.DurationSec)*time.Second)
@@ -167,6 +168,7 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 		matched     uint64
 		written     uint64
 		deduped     uint64
+		rejected    uint64
 		next        atomic.Uint64
 		start       = time.Now()
 		fatalErr    error
@@ -182,16 +184,18 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 				break
 			}
 			batch.Reset()
-			var batchScanned, batchMatched, batchDedup uint64
+			var batchScanned, batchMatched, batchDedup, batchRejected uint64
 			for batch.Len() < cfg.BatchSize {
+				if runCtx.Err() != nil {
+					break
+				}
 				idx := next.Add(1) - 1
 				raw := records[int(idx%uint64(len(records)))]
 				batchScanned++
-				outcome, err := norm.AppendRawJSONWork(raw, batch)
-				if err != nil {
-					continue
-				}
+				outcome, _ := norm.IngestRawJSON(raw, batch)
 				switch outcome {
+				case normalizer.OutcomeRejected:
+					batchRejected++
 				case normalizer.OutcomeAdded:
 					batchMatched++
 				case normalizer.OutcomeDuplicate:
@@ -235,6 +239,7 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 			matched += batchMatched
 			written += uint64(batch.Len())
 			deduped += batchDedup
+			rejected += batchRejected
 			mu.Unlock()
 
 			select {
@@ -261,6 +266,7 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 	base.Matched = matched
 	base.Written = written
 	base.DedupDropped = deduped
+	base.Rejected = rejected
 	err := fatalErr
 	mu.Unlock()
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {

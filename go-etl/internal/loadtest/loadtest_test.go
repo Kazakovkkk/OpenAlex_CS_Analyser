@@ -1,4 +1,4 @@
-﻿package loadtest
+package loadtest
 
 import (
 	"bytes"
@@ -18,6 +18,8 @@ import (
 
 func workJSON(id int) []byte {
 	return []byte(fmt.Sprintf(`{"id":"https://openalex.org/W%d","title":"Paper %d",`+
+		`"type":"article","is_retracted":false,`+
+		`"updated_date":"2026-10-14T12:00:00.000000",`+
 		`"is_xpac":false,"publication_year":2024,`+
 		`"primary_topic":{"id":"https://openalex.org/T10108","score":0.9,`+
 		`"field":{"id":"https://openalex.org/fields/17"}},`+

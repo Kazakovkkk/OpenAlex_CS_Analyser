@@ -1,4 +1,4 @@
-package ingest
+﻿package ingest
 
 import (
 	"context"
@@ -47,10 +47,7 @@ type Options struct {
 	Metrics            *metrics.JobMetrics
 	FatalFailureStreak int
 	Logger             *slog.Logger
-	// MaxRecords is the job-level row budget (0 = unlimited). The feed stops once
-	// it is spent, and the remaining budget is handed to each processor so a single
-	// huge file cannot blow past it.
-	MaxRecords int64
+	MaxRecords         int64
 }
 
 func (o Options) withDefaults() Options {
@@ -101,13 +98,13 @@ type Result struct {
 	Matched      uint64
 	Written      uint64
 	DedupDropped uint64
+	Rejected     uint64
 
 	BytesRead    uint64
 	HTTPRequests uint64
 	PlanBytes    int64
 
-	Stopped bool
-	// Truncated is true when MaxRecords stopped the feed before the last file.
+	Stopped   bool
 	Truncated bool
 	Elapsed   time.Duration
 	LastDone  string
@@ -202,6 +199,7 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 		res.Matched += r.MatchedRows
 		res.Written += r.WrittenRows
 		res.DedupDropped += r.DedupDropped
+		res.Rejected += r.RejectedRows
 		res.BytesRead += r.BytesRead
 		res.HTTPRequests += r.HTTPRequests
 		res.PlanBytes += r.PrefetchPlanBytes
@@ -211,14 +209,13 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 		mu.Unlock()
 	}
 
-	// remainingBudget returns the rows still allowed by MaxRecords (0 = unlimited).
 	remainingBudget := func() int64 {
 		if opts.MaxRecords <= 0 {
 			return 0
 		}
 		done := writtenTotal.Load()
 		if done >= uint64(opts.MaxRecords) {
-			return 0 // nothing left, but callers check truncated() before starting a file
+			return 0
 		}
 		return int64(uint64(opts.MaxRecords) - done)
 	}
@@ -235,7 +232,7 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 
 			limit := remainingBudget()
 			if opts.MaxRecords > 0 && limit == 0 {
-				return // budget spent while this file was queued
+				return
 			}
 			var lastErr error
 			done := false
@@ -310,7 +307,8 @@ feed:
 	}
 	logger.Info("ingest: run finished",
 		"job", res.JobID, "done", res.FilesDone, "failed", res.FilesFailed,
-		"skipped", res.FilesSkipped, "stopped", res.Stopped, "elapsed", res.Elapsed.Round(time.Millisecond))
+		"skipped", res.FilesSkipped, "stopped", res.Stopped,
+		"rejected", res.Rejected, "elapsed", res.Elapsed.Round(time.Millisecond))
 	return res, nil
 }
 

@@ -7,14 +7,11 @@ import (
 )
 
 const (
-	minDate32Year = 1900
-	maxDate32Year = 2299
+	minDateYear = 1
+	maxDateYear = 9999
 )
 
 var (
-	minDate32Days = int32(time.Date(minDate32Year, 1, 1, 0, 0, 0, 0, time.UTC).Unix() / 86400)
-	maxDate32Days = int32(time.Date(maxDate32Year, 12, 31, 0, 0, 0, 0, time.UTC).Unix() / 86400)
-
 	unixEpochUTC = time.Unix(0, 0).UTC()
 )
 
@@ -90,10 +87,14 @@ func ParseDomainID(raw string) uint8 {
 }
 
 func ParseParquetDate32(days int32) (time.Time, bool) {
-	if days < minDate32Days || days > maxDate32Days {
+	return ParseDateDays(days)
+}
+func ParseDateDays(days int32) (time.Time, bool) {
+	t := time.Unix(int64(days)*86400, 0).UTC()
+	if y := t.Year(); y < minDateYear || y > maxDateYear {
 		return time.Time{}, false
 	}
-	return time.Unix(int64(days)*86400, 0).UTC(), true
+	return t, true
 }
 
 func ParseDate32String(s string) (time.Time, bool) {
@@ -113,7 +114,7 @@ func ParseDate32String(s string) (time.Time, bool) {
 	if !okY || !okM || !okD {
 		return time.Time{}, false
 	}
-	if year < minDate32Year || year > maxDate32Year || month < 1 || month > 12 || day < 1 || day > 31 {
+	if year < minDateYear || year > maxDateYear || month < 1 || month > 12 || day < 1 || day > 31 {
 		return time.Time{}, false
 	}
 
@@ -141,19 +142,30 @@ func ParseParquetTimestampMicros(us int64) time.Time {
 }
 
 func ParseTimestampString(s string) time.Time {
-	if len(s) == 0 {
-		return unixEpochUTC
-	}
-	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-		return t.UTC()
-	}
-	if t, err := time.Parse("2006-01-02T15:04:05.999999999", s); err == nil {
-		return t.UTC()
-	}
-	if t, err := time.Parse("2006-01-02", s); err == nil {
-		return t.UTC()
+	if t, ok := ParseUpdatedDate(s); ok {
+		return t
 	}
 	return unixEpochUTC
+}
+
+func ParseUpdatedDate(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func NormalizeKeyword(s string) string {

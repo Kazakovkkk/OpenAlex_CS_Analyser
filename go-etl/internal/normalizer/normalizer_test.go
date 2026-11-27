@@ -136,130 +136,53 @@ func TestParquetAndJSONParity(t *testing.T) {
 
 	pubDate := time.Date(2024, 5, 10, 0, 0, 0, 0, time.UTC)
 	pubDays := int32(pubDate.Unix() / 86400)
-	created := time.Date(2025, 10, 10, 0, 0, 0, 0, time.UTC)
 	updated := time.Date(2026, 4, 11, 6, 19, 8, 300824000, time.UTC)
 
 	pw := &ParquetWork{
-		ID:                   ptr("https://openalex.org/W2741809807"),
-		DOI:                  ptr("https://doi.org/10.1000/cs-test"),
-		Title:                ptr("High-Performance Go ETL"),
-		PublicationYear:      ptr(int32(2024)),
-		PublicationDate:      ptr(pubDays),
-		CreatedDate:          ptr(created.UnixMicro()),
-		UpdatedDate:          ptr(updated.UnixMicro()),
-		Type:                 ptr("article"),
-		Language:             ptr("en"),
-		IsRetracted:          ptr(false),
-		IsXPAC:               ptr(false),
-		CitedByCount:         ptr(int32(120)),
-		ReferencedWorksCount: ptr(int32(45)),
-		AuthorsCount:         ptr(int32(2)),
-		FWCI:                 ptr(2.75),
+		ID:              ptr("https://openalex.org/W2741809807"),
+		PublicationYear: ptr(int32(2024)),
+		PublicationDate: ptr(pubDays),
+		UpdatedDate:     ptr(updated.UnixMicro()),
+		Type:            ptr("article"),
+		IsRetracted:     ptr(false),
+		IsXPAC:          ptr(false),
+		FWCI:            ptr(2.75),
 		PrimaryTopic: &ParquetPrimaryTopic{
-			ID:       ptr("https://openalex.org/T12799"),
-			Score:    ptr(float32(0.95)),
-			Subfield: &ParquetIDRef{ID: ptr("https://openalex.org/subfields/1710")},
-			Field:    &ParquetIDRef{ID: ptr("https://openalex.org/fields/17")},
-			Domain:   &ParquetIDRef{ID: ptr("https://openalex.org/domains/3")},
+			ID:    ptr("https://openalex.org/T12799"),
+			Field: &ParquetIDRef{ID: ptr("https://openalex.org/fields/17")},
 		},
 		PrimaryLocation: &ParquetPrimaryLocation{
 			Source: &ParquetPrimarySource{
 				ID:   ptr("https://openalex.org/S4306402476"),
 				Type: ptr("journal"),
 			},
-			IsOA: ptr(true),
-		},
-		Authorships: []ParquetWorkAuthorship{
-			{
-				Author:         &ParquetIDRef{ID: ptr("https://openalex.org/A10")},
-				AuthorPosition: ptr("first"),
-				Countries:      []string{"us", "US"},
-				Institutions: []ParquetWorkInstitution{
-					{ID: ptr("https://openalex.org/I100"), CountryCode: ptr("us")},
-				},
-			},
-			{
-				Author:         &ParquetIDRef{ID: ptr("https://openalex.org/A20")},
-				AuthorPosition: ptr("last"),
-				Institutions: []ParquetWorkInstitution{
-					{ID: ptr("https://openalex.org/I200"), CountryCode: ptr("de")},
-					{ID: ptr("https://openalex.org/I100"), CountryCode: ptr("us")},
-				},
-			},
 		},
 		Topics: []ParquetWorkTopic{
 			{ID: ptr("https://openalex.org/T12799"), Score: ptr(float32(0.95))},
 			{ID: ptr("https://openalex.org/T10616"), Score: ptr(float32(0.42))},
 		},
-		Keywords: []ParquetWorkKeyword{
-			{DisplayName: ptr("  Deep Learning ")},
-			{DisplayName: ptr("deep learning")},
-			{DisplayName: ptr("NLP")},
-		},
-		CountsByYear: []ParquetYearCount{
-			{Year: ptr(int32(2025)), CitedByCount: ptr(int32(70))},
-			{Year: ptr(int32(2024)), CitedByCount: ptr(int32(50))},
-		},
-		AbstractInvertedIndex: ptr(`{"hello": [0], "world": [1]}`),
 	}
 
 	rawJSON := []byte(`{
 		"id": "https://openalex.org/W2741809807",
-		"doi": "https://doi.org/10.1000/cs-test",
-		"title": "High-Performance Go ETL",
 		"publication_year": 2024,
 		"publication_date": "2024-05-10",
-		"created_date": "` + created.Format(time.RFC3339Nano) + `",
 		"updated_date": "` + updated.Format(time.RFC3339Nano) + `",
 		"type": "article",
-		"language": "en",
 		"is_retracted": false,
 		"is_xpac": false,
-		"cited_by_count": 120,
-		"referenced_works_count": 45,
-		"authors_count": 2,
 		"fwci": 2.75,
 		"primary_topic": {
 			"id": "https://openalex.org/T12799",
-			"score": 0.95,
-			"subfield": {"id": "https://openalex.org/subfields/1710"},
-			"field": {"id": "https://openalex.org/fields/17"},
-			"domain": {"id": "https://openalex.org/domains/3"}
+			"field": {"id": "https://openalex.org/fields/17"}
 		},
 		"primary_location": {
-			"source": {"id": "https://openalex.org/S4306402476", "type": "journal"},
-			"is_oa": true
+			"source": {"id": "https://openalex.org/S4306402476", "type": "journal"}
 		},
-		"authorships": [
-			{
-				"author": {"id": "https://openalex.org/A10"},
-				"author_position": "first",
-				"countries": ["us", "US"],
-				"institutions": [{"id": "https://openalex.org/I100", "country_code": "us"}]
-			},
-			{
-				"author": {"id": "https://openalex.org/A20"},
-				"author_position": "last",
-				"institutions": [
-					{"id": "https://openalex.org/I200", "country_code": "de"},
-					{"id": "https://openalex.org/I100", "country_code": "us"}
-				]
-			}
-		],
 		"topics": [
 			{"id": "https://openalex.org/T12799", "score": 0.95},
 			{"id": "https://openalex.org/T10616", "score": 0.42}
-		],
-		"keywords": [
-			{"display_name": "  Deep Learning "},
-			{"display_name": "deep learning"},
-			{"display_name": "NLP"}
-		],
-		"counts_by_year": [
-			{"year": 2025, "cited_by_count": 70},
-			{"year": 2024, "cited_by_count": 50}
-		],
-		"abstract_inverted_index": {"hello": [0], "world": [1]}
+		]
 	}`)
 
 	nNoDedup := NewNormalizer(nil)
@@ -278,8 +201,8 @@ func TestParquetAndJSONParity(t *testing.T) {
 	if bP.WorkIDs[0] != 2741809807 || bP.WorkIDs[0] != bJ.WorkIDs[0] {
 		t.Fatalf("WorkIDs mismatch: P=%d J=%d", bP.WorkIDs[0], bJ.WorkIDs[0])
 	}
-	if bP.DOIs[0] != bJ.DOIs[0] || bP.Titles[0] != bJ.Titles[0] || bP.Abstracts[0] != "hello world" || bJ.Abstracts[0] != "hello world" {
-		t.Fatalf("text fields mismatch: P=(%q,%q) J=(%q,%q)", bP.Titles[0], bP.Abstracts[0], bJ.Titles[0], bJ.Abstracts[0])
+	if bP.WorkTypes[0] != "article" || bJ.WorkTypes[0] != "article" {
+		t.Fatalf("WorkTypes mismatch: P=%q J=%q", bP.WorkTypes[0], bJ.WorkTypes[0])
 	}
 	if bP.PubYears[0] != 2024 || bJ.PubYears[0] != 2024 {
 		t.Fatalf("PubYears mismatch: P=%d J=%d", bP.PubYears[0], bJ.PubYears[0])
@@ -287,45 +210,26 @@ func TestParquetAndJSONParity(t *testing.T) {
 	if bP.PubDates[0] == nil || bJ.PubDates[0] == nil || !bP.PubDates[0].Equal(pubDate) || !bJ.PubDates[0].Equal(pubDate) {
 		t.Fatalf("PubDates mismatch: P=%v J=%v", bP.PubDates[0], bJ.PubDates[0])
 	}
-	if !bP.CreatedDates[0].Equal(created) || !bJ.CreatedDates[0].Equal(created) {
-		t.Fatalf("CreatedDates mismatch: P=%v J=%v", bP.CreatedDates[0], bJ.CreatedDates[0])
-	}
 	if !bP.UpdatedDates[0].Equal(updated) || !bJ.UpdatedDates[0].Equal(updated) {
 		t.Fatalf("UpdatedDates mismatch: P=%v J=%v", bP.UpdatedDates[0], bJ.UpdatedDates[0])
+	}
+	if bP.IsRetracted[0] != 0 || bJ.IsRetracted[0] != 0 {
+		t.Fatalf("IsRetracted mismatch: P=%d J=%d", bP.IsRetracted[0], bJ.IsRetracted[0])
 	}
 	if bP.FWCIs[0] == nil || bJ.FWCIs[0] == nil || *bP.FWCIs[0] != 2.75 || *bJ.FWCIs[0] != 2.75 {
 		t.Fatalf("FWCIs mismatch: P=%v J=%v", bP.FWCIs[0], bJ.FWCIs[0])
 	}
 	if bP.PrimaryTopicIDs[0] != 12799 || bJ.PrimaryTopicIDs[0] != 12799 ||
-		bP.PrimarySubfieldIDs[0] != 1710 || bJ.PrimarySubfieldIDs[0] != 1710 ||
 		bP.PrimaryFieldIDs[0] != 17 || bJ.PrimaryFieldIDs[0] != 17 ||
-		bP.PrimaryDomainIDs[0] != 3 || bJ.PrimaryDomainIDs[0] != 3 ||
 		bP.PrimarySourceIDs[0] != 4306402476 || bJ.PrimarySourceIDs[0] != 4306402476 ||
-		bP.PrimarySourceTypes[0] != "journal" || bJ.PrimarySourceTypes[0] != "journal" ||
-		bP.PrimaryIsOA[0] != 1 || bJ.PrimaryIsOA[0] != 1 {
+		bP.PrimarySourceTypes[0] != "journal" || bJ.PrimarySourceTypes[0] != "journal" {
 		t.Fatal("primary topic/location mismatch between Parquet and JSON")
-	}
-	if bP.FirstAuthorCountries[0] != "US" || bJ.FirstAuthorCountries[0] != "US" {
-		t.Fatalf("FirstAuthorCountries: P=%q J=%q, want US", bP.FirstAuthorCountries[0], bJ.FirstAuthorCountries[0])
-	}
-	if !slices.Equal(bP.CountryCodes[0], []string{"US", "DE"}) || !slices.Equal(bJ.CountryCodes[0], []string{"US", "DE"}) {
-		t.Fatalf("CountryCodes: P=%v J=%v, want [US DE]", bP.CountryCodes[0], bJ.CountryCodes[0])
-	}
-	if !slices.Equal(bP.AuthorIDs[0], []uint64{10, 20}) || !slices.Equal(bJ.AuthorIDs[0], []uint64{10, 20}) {
-		t.Fatalf("AuthorIDs: P=%v J=%v, want [10 20]", bP.AuthorIDs[0], bJ.AuthorIDs[0])
-	}
-	if !slices.Equal(bP.InstitutionIDs[0], []uint64{100, 200}) || !slices.Equal(bJ.InstitutionIDs[0], []uint64{100, 200}) {
-		t.Fatalf("InstitutionIDs: P=%v J=%v, want [100 200]", bP.InstitutionIDs[0], bJ.InstitutionIDs[0])
 	}
 	if !slices.Equal(bP.TopicIDs[0], []uint32{12799, 10616}) || !slices.Equal(bJ.TopicIDs[0], []uint32{12799, 10616}) {
 		t.Fatalf("TopicIDs: P=%v J=%v", bP.TopicIDs[0], bJ.TopicIDs[0])
 	}
-	if !slices.Equal(bP.Keywords[0], []string{"deep learning", "nlp"}) || !slices.Equal(bJ.Keywords[0], []string{"deep learning", "nlp"}) {
-		t.Fatalf("Keywords: P=%v J=%v, want [deep learning nlp]", bP.Keywords[0], bJ.Keywords[0])
-	}
-	if !slices.Equal(bP.CitedByYears[0], []uint16{2025, 2024}) || !slices.Equal(bJ.CitedByYears[0], []uint16{2025, 2024}) ||
-		!slices.Equal(bP.CitedByYearCounts[0], []uint32{70, 50}) || !slices.Equal(bJ.CitedByYearCounts[0], []uint32{70, 50}) {
-		t.Fatal("CountsByYear mismatch between Parquet and JSON")
+	if !slices.Equal(bP.TopicScores[0], []float32{0.95, 0.42}) || !slices.Equal(bJ.TopicScores[0], []float32{0.95, 0.42}) {
+		t.Fatalf("TopicScores: P=%v J=%v", bP.TopicScores[0], bJ.TopicScores[0])
 	}
 	if out, err := nNoDedup.AppendRawJSONWork(rawJSON, bJ); err != nil || out != OutcomeAdded || bJ.Len() != 2 {
 		t.Fatalf("nil dedup should allow repeated work: out=%d err=%v len=%d", out, err, bJ.Len())
@@ -341,7 +245,7 @@ func TestParquetAndJSONParity(t *testing.T) {
 	}
 }
 
-func TestDirtyRecordsPreservedForTask1(t *testing.T) {
+func TestAppendPreservesRawFieldsWithoutValidation(t *testing.T) {
 	t.Parallel()
 
 	csTopic := &ParquetPrimaryTopic{
@@ -365,9 +269,8 @@ func TestDirtyRecordsPreservedForTask1(t *testing.T) {
 	}
 	wDirty := &ParquetWork{
 		ID:           ptr("broken-id"),
-		Type:         ptr("paratext"),
+		Type:         ptr(""),
 		IsRetracted:  ptr(true),
-		AuthorsCount: ptr(int32(0)),
 		FWCI:         ptr(math.NaN()),
 		PrimaryTopic: csTopic,
 	}
@@ -385,16 +288,15 @@ func TestDirtyRecordsPreservedForTask1(t *testing.T) {
 
 	assertWorksBatchColumnLengths(t, b, 4)
 
-	if b.PubYears[0] != 1400 || b.PubDates[0] != nil {
-		t.Fatalf("row 0 (1400): year=%d date=%v, want 1400 & nil", b.PubYears[0], b.PubDates[0])
+	if b.PubYears[0] != 1400 || b.PubDates[0] == nil || b.PubDates[0].Format("2006-01-02") != "1400-01-01" {
+		t.Fatalf("row 0 (1400): year=%d date=%v, want 1400 & 1400-01-01", b.PubYears[0], b.PubDates[0])
 	}
-	if b.PubYears[1] != 2099 || b.PubDates[1] != nil {
-		t.Fatalf("row 1 (2099): year=%d date=%v, want 2099 & nil", b.PubYears[1], b.PubDates[1])
+	if b.PubYears[1] != 2099 || b.PubDates[1] == nil || b.PubDates[1].Format("2006-01-02") != "2500-01-01" {
+		t.Fatalf("row 1 (2099): year=%d date=%v, want 2099 & 2500-01-01", b.PubYears[1], b.PubDates[1])
 	}
 	if b.WorkIDs[2] != 0 || b.PubYears[2] != 0 || b.PubDates[2] != nil || b.FWCIs[2] != nil ||
-		b.IsRetracted[2] != 1 || b.WorkTypes[2] != "paratext" || b.AuthorsCounts[2] != 0 ||
-		b.Titles[2] != "" || b.Abstracts[2] != "" {
-		t.Fatalf("row 2 (dirty retracted paratext) not preserved properly")
+		b.IsRetracted[2] != 1 || b.WorkTypes[2] != "" {
+		t.Fatalf("row 2 (dirty retracted record) not preserved properly")
 	}
 	if b.WorkIDs[3] != 0 {
 		t.Fatalf("row 3 WorkID = %d, want 0", b.WorkIDs[3])
@@ -458,30 +360,18 @@ func TestParquetStructTagsRoundTrip(t *testing.T) {
 	workIn := []ParquetWork{
 		{
 			ID:              ptr("https://openalex.org/W555"),
-			Title:           ptr("Tag Check"),
+			Type:            ptr("article"),
 			PublicationYear: ptr(int32(2026)),
 			PublicationDate: ptr(int32(20454)),
-			CreatedDate:     ptr(int64(1760054400000000)),
 			UpdatedDate:     ptr(int64(1775888348300824)),
+			IsRetracted:     ptr(false),
 			IsXPAC:          ptr(false),
 			FWCI:            ptr(1.25),
 			PrimaryTopic: &ParquetPrimaryTopic{
 				ID:    ptr("https://openalex.org/T10001"),
-				Score: ptr(float32(0.8)),
 				Field: &ParquetIDRef{ID: ptr("https://openalex.org/fields/17")},
 			},
-			Topics:   []ParquetWorkTopic{{ID: ptr("https://openalex.org/T10001"), Score: ptr(float32(0.8))}},
-			Keywords: []ParquetWorkKeyword{{DisplayName: ptr("Systems")}},
-			Authorships: []ParquetWorkAuthorship{
-				{
-					Author:         &ParquetIDRef{ID: ptr("https://openalex.org/A77")},
-					AuthorPosition: ptr("first"),
-					Countries:      []string{"NL"},
-					Institutions:   []ParquetWorkInstitution{{ID: ptr("https://openalex.org/I88"), CountryCode: ptr("NL")}},
-				},
-			},
-			CountsByYear:          []ParquetYearCount{{Year: ptr(int32(2026)), CitedByCount: ptr(int32(5))}},
-			AbstractInvertedIndex: ptr(`{"fast":[0],"etl":[1]}`),
+			Topics: []ParquetWorkTopic{{ID: ptr("https://openalex.org/T10001"), Score: ptr(float32(0.8))}},
 		},
 	}
 
@@ -490,8 +380,8 @@ func TestParquetStructTagsRoundTrip(t *testing.T) {
 	if out := NewNormalizer(nil).AppendParquetWork(&workOut[0], b); out != OutcomeAdded {
 		t.Fatalf("round-trip AppendParquetWork = %d, want OutcomeAdded", out)
 	}
-	if b.WorkIDs[0] != 555 || b.Abstracts[0] != "fast etl" || b.FirstAuthorCountries[0] != "NL" {
-		t.Fatalf("unexpected round-trip work: id=%d abs=%q cc=%q", b.WorkIDs[0], b.Abstracts[0], b.FirstAuthorCountries[0])
+	if b.WorkIDs[0] != 555 || b.WorkTypes[0] != "article" || b.PrimaryFieldIDs[0] != 17 {
+		t.Fatalf("unexpected round-trip work: id=%d type=%q field=%d", b.WorkIDs[0], b.WorkTypes[0], b.PrimaryFieldIDs[0])
 	}
 
 	topicOut := roundTripParquet(t, []ParquetTopic{{
@@ -546,38 +436,19 @@ func assertWorksBatchColumnLengths(t *testing.T, b *sink.WorksBatch, want int) {
 	t.Helper()
 
 	cols := map[string]int{
-		"WorkIDs":              len(b.WorkIDs),
-		"DOIs":                 len(b.DOIs),
-		"Titles":               len(b.Titles),
-		"Abstracts":            len(b.Abstracts),
-		"PubYears":             len(b.PubYears),
-		"PubDates":             len(b.PubDates),
-		"CreatedDates":         len(b.CreatedDates),
-		"UpdatedDates":         len(b.UpdatedDates),
-		"WorkTypes":            len(b.WorkTypes),
-		"Languages":            len(b.Languages),
-		"IsRetracted":          len(b.IsRetracted),
-		"CitedByCounts":        len(b.CitedByCounts),
-		"RefWorksCounts":       len(b.RefWorksCounts),
-		"AuthorsCounts":        len(b.AuthorsCounts),
-		"FWCIs":                len(b.FWCIs),
-		"PrimaryTopicIDs":      len(b.PrimaryTopicIDs),
-		"PrimaryTopicScores":   len(b.PrimaryTopicScores),
-		"PrimarySubfieldIDs":   len(b.PrimarySubfieldIDs),
-		"PrimaryFieldIDs":      len(b.PrimaryFieldIDs),
-		"PrimaryDomainIDs":     len(b.PrimaryDomainIDs),
-		"PrimarySourceIDs":     len(b.PrimarySourceIDs),
-		"PrimarySourceTypes":   len(b.PrimarySourceTypes),
-		"PrimaryIsOA":          len(b.PrimaryIsOA),
-		"FirstAuthorCountries": len(b.FirstAuthorCountries),
-		"CountryCodes":         len(b.CountryCodes),
-		"AuthorIDs":            len(b.AuthorIDs),
-		"InstitutionIDs":       len(b.InstitutionIDs),
-		"TopicIDs":             len(b.TopicIDs),
-		"TopicScores":          len(b.TopicScores),
-		"Keywords":             len(b.Keywords),
-		"CitedByYears":         len(b.CitedByYears),
-		"CitedByYearCounts":    len(b.CitedByYearCounts),
+		"WorkIDs":            len(b.WorkIDs),
+		"UpdatedDates":       len(b.UpdatedDates),
+		"WorkTypes":          len(b.WorkTypes),
+		"PrimaryFieldIDs":    len(b.PrimaryFieldIDs),
+		"IsRetracted":        len(b.IsRetracted),
+		"PubYears":           len(b.PubYears),
+		"PubDates":           len(b.PubDates),
+		"PrimaryTopicIDs":    len(b.PrimaryTopicIDs),
+		"TopicIDs":           len(b.TopicIDs),
+		"TopicScores":        len(b.TopicScores),
+		"PrimarySourceIDs":   len(b.PrimarySourceIDs),
+		"PrimarySourceTypes": len(b.PrimarySourceTypes),
+		"FWCIs":              len(b.FWCIs),
 	}
 	for name, got := range cols {
 		if got != want {

@@ -30,14 +30,21 @@ const (
 	OutcomeFilteredOut WorkOutcome = iota
 	OutcomeDuplicate
 	OutcomeAdded
+	OutcomeRejected
 )
 
 type Normalizer struct {
-	dedup *WorkDeduplicator
+	dedup        *WorkDeduplicator
+	snapshotYear int
+	knownWork    func(workID uint64) bool
 }
 
-func NewNormalizer(dedup *WorkDeduplicator) *Normalizer {
-	return &Normalizer{dedup: dedup}
+func NewNormalizer(dedup *WorkDeduplicator, opts ...Option) *Normalizer {
+	n := &Normalizer{dedup: dedup}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
 }
 
 func PrimaryTopicBytesIsCS(rawPrimaryTopic []byte) bool {
@@ -58,6 +65,9 @@ func IsCSParquetWork(w *ParquetWork) bool {
 	if w == nil || (w.IsXPAC != nil && *w.IsXPAC) {
 		return false
 	}
+	if !corpusTypeAllows(derefString(w.Type)) {
+		return false
+	}
 	if w.PrimaryTopic == nil || w.PrimaryTopic.Field == nil || w.PrimaryTopic.Field.ID == nil {
 		return false
 	}
@@ -67,6 +77,9 @@ func IsCSParquetWork(w *ParquetWork) bool {
 
 func IsCSJSONWork(w *JSONWork) bool {
 	if w == nil || w.IsXPAC {
+		return false
+	}
+	if !corpusTypeAllows(w.Type) {
 		return false
 	}
 	if w.PrimaryTopic == nil || w.PrimaryTopic.Field == nil {
@@ -92,10 +105,6 @@ func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkO
 			pubDatePtr = b.AllocPubDate(t)
 		}
 	}
-	createdDate := unixEpochUTC
-	if w.CreatedDate != nil {
-		createdDate = ParseParquetTimestampMicros(*w.CreatedDate)
-	}
 	updatedDate := unixEpochUTC
 	if w.UpdatedDate != nil {
 		updatedDate = ParseParquetTimestampMicros(*w.UpdatedDate)
@@ -106,92 +115,45 @@ func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkO
 		fwciPtr = b.AllocFWCI(float32(*w.FWCI))
 	}
 
-	var abstract string
-	if w.AbstractInvertedIndex != nil && len(*w.AbstractInvertedIndex) > 2 {
-		abstract = ReconstructAbstractJSON([]byte(*w.AbstractInvertedIndex))
-	}
-
 	var pubYear uint16
 	if w.PublicationYear != nil {
 		pubYear = ClampUint16(*w.PublicationYear)
 	}
-	var authorsCount uint16
-	if w.AuthorsCount != nil {
-		authorsCount = ClampUint16(*w.AuthorsCount)
-	} else {
-		authorsCount = ClampUint16(int32(len(w.Authorships)))
-	}
-
-	var pTopicID, pSubfieldID uint32
-	var pTopicScore float32
+	var pTopicID uint32
 	var pFieldID uint16
-	var pDomainID uint8
 	if pt := w.PrimaryTopic; pt != nil {
 		pTopicID = ParseTopicID(derefString(pt.ID))
-		pTopicScore = derefFloat32(pt.Score)
-		if pt.Subfield != nil {
-			pSubfieldID = ParseSubfieldID(derefString(pt.Subfield.ID))
-		}
 		if pt.Field != nil {
 			pFieldID = ParseFieldID(derefString(pt.Field.ID))
-		}
-		if pt.Domain != nil {
-			pDomainID = ParseDomainID(derefString(pt.Domain.ID))
 		}
 	}
 
 	var pSourceID uint64
 	var pSourceType string
-	var pIsOA uint8
-	if pl := w.PrimaryLocation; pl != nil {
-		pIsOA = boolToUint8(derefBool(pl.IsOA))
-		if pl.Source != nil {
-			pSourceID = ParseSourceID(derefString(pl.Source.ID))
-			pSourceType = derefString(pl.Source.Type)
-		}
+	if pl := w.PrimaryLocation; pl != nil && pl.Source != nil {
+		pSourceID = ParseSourceID(derefString(pl.Source.ID))
+		pSourceType = derefString(pl.Source.Type)
 	}
 
-	firstCountry, countries, authorIDs, instIDs := extractParquetAuthorships(w.Authorships)
 	topicIDs, topicScores := extractParquetTopics(w.Topics)
-	keywords := extractParquetKeywords(w.Keywords)
-	citedYears, citedCounts := extractParquetCountsByYear(w.CountsByYear)
 
 	b.WorkIDs = append(b.WorkIDs, workID)
-	b.DOIs = append(b.DOIs, derefString(w.DOI))
-	b.Titles = append(b.Titles, derefString(w.Title))
-	b.Abstracts = append(b.Abstracts, abstract)
 
 	b.PubYears = append(b.PubYears, pubYear)
 	b.PubDates = append(b.PubDates, pubDatePtr)
-	b.CreatedDates = append(b.CreatedDates, createdDate)
 	b.UpdatedDates = append(b.UpdatedDates, updatedDate)
 
 	b.WorkTypes = append(b.WorkTypes, derefString(w.Type))
-	b.Languages = append(b.Languages, derefString(w.Language))
 	b.IsRetracted = append(b.IsRetracted, boolToUint8(derefBool(w.IsRetracted)))
-	b.CitedByCounts = append(b.CitedByCounts, ClampUint32(derefInt32(w.CitedByCount)))
-	b.RefWorksCounts = append(b.RefWorksCounts, ClampUint32(derefInt32(w.ReferencedWorksCount)))
-	b.AuthorsCounts = append(b.AuthorsCounts, authorsCount)
 	b.FWCIs = append(b.FWCIs, fwciPtr)
 
 	b.PrimaryTopicIDs = append(b.PrimaryTopicIDs, pTopicID)
-	b.PrimaryTopicScores = append(b.PrimaryTopicScores, pTopicScore)
-	b.PrimarySubfieldIDs = append(b.PrimarySubfieldIDs, pSubfieldID)
 	b.PrimaryFieldIDs = append(b.PrimaryFieldIDs, pFieldID)
-	b.PrimaryDomainIDs = append(b.PrimaryDomainIDs, pDomainID)
 	b.PrimarySourceIDs = append(b.PrimarySourceIDs, pSourceID)
 	b.PrimarySourceTypes = append(b.PrimarySourceTypes, pSourceType)
-	b.PrimaryIsOA = append(b.PrimaryIsOA, pIsOA)
 
-	b.FirstAuthorCountries = append(b.FirstAuthorCountries, firstCountry)
-	b.CountryCodes = append(b.CountryCodes, countries)
-	b.AuthorIDs = append(b.AuthorIDs, authorIDs)
-	b.InstitutionIDs = append(b.InstitutionIDs, instIDs)
 	b.TopicIDs = append(b.TopicIDs, topicIDs)
 	b.TopicScores = append(b.TopicScores, topicScores)
-	b.Keywords = append(b.Keywords, keywords)
-	b.CitedByYears = append(b.CitedByYears, citedYears)
-	b.CitedByYearCounts = append(b.CitedByYearCounts, citedCounts)
 
 	return OutcomeAdded
 }
@@ -205,6 +167,23 @@ func (n *Normalizer) AppendRawJSONWork(raw []byte, b *sink.WorksBatch) (WorkOutc
 		return OutcomeFilteredOut, fmt.Errorf("sonic unmarshal work: %w", err)
 	}
 	return n.AppendJSONWork(&jw, b), nil
+}
+
+func (n *Normalizer) IngestRawJSON(raw []byte, b *sink.WorksBatch) (WorkOutcome, RejectReason) {
+	if !FastJSONPreFilter(raw) {
+		return OutcomeFilteredOut, ""
+	}
+	var jw JSONWork
+	if err := sonic.Unmarshal(raw, &jw); err != nil {
+		return OutcomeRejected, RejectParseError
+	}
+	if !IsCSJSONWork(&jw) {
+		return OutcomeFilteredOut, ""
+	}
+	if reason := n.PrepareJSON(&jw); reason != "" {
+		return OutcomeRejected, reason
+	}
+	return n.AppendJSONWork(&jw, b), ""
 }
 
 func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome {
@@ -221,7 +200,6 @@ func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome
 	if t, ok := ParseDate32String(w.PublicationDate); ok {
 		pubDatePtr = b.AllocPubDate(t)
 	}
-	createdDate := ParseTimestampString(w.CreatedDate)
 	updatedDate := ParseTimestampString(w.UpdatedDate)
 
 	var fwciPtr *float32
@@ -229,83 +207,41 @@ func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome
 		fwciPtr = b.AllocFWCI(float32(*w.FWCI))
 	}
 
-	abstract := ReconstructAbstract(w.AbstractInvertedIdx)
-
-	authorsCount := ClampUint16(w.AuthorsCount)
-	if authorsCount == 0 && len(w.Authorships) > 0 {
-		authorsCount = ClampUint16(int32(len(w.Authorships)))
-	}
-
-	var pTopicID, pSubfieldID uint32
-	var pTopicScore float32
+	var pTopicID uint32
 	var pFieldID uint16
-	var pDomainID uint8
 	if pt := w.PrimaryTopic; pt != nil {
 		pTopicID = ParseTopicID(pt.ID)
-		pTopicScore = pt.Score
-		if pt.Subfield != nil {
-			pSubfieldID = ParseSubfieldID(pt.Subfield.ID)
-		}
 		if pt.Field != nil {
 			pFieldID = ParseFieldID(pt.Field.ID)
-		}
-		if pt.Domain != nil {
-			pDomainID = ParseDomainID(pt.Domain.ID)
 		}
 	}
 
 	var pSourceID uint64
 	var pSourceType string
-	var pIsOA uint8
-	if pl := w.PrimaryLocation; pl != nil {
-		pIsOA = boolToUint8(pl.IsOA)
-		if pl.Source != nil {
-			pSourceID = ParseSourceID(pl.Source.ID)
-			pSourceType = pl.Source.Type
-		}
+	if pl := w.PrimaryLocation; pl != nil && pl.Source != nil {
+		pSourceID = ParseSourceID(pl.Source.ID)
+		pSourceType = pl.Source.Type
 	}
 
-	firstCountry, countries, authorIDs, instIDs := extractJSONAuthorships(w.Authorships)
 	topicIDs, topicScores := extractJSONTopics(w.Topics)
-	keywords := extractJSONKeywords(w.Keywords)
-	citedYears, citedCounts := extractJSONCountsByYear(w.CountsByYear)
 
 	b.WorkIDs = append(b.WorkIDs, workID)
-	b.DOIs = append(b.DOIs, w.DOI)
-	b.Titles = append(b.Titles, w.Title)
-	b.Abstracts = append(b.Abstracts, abstract)
 
 	b.PubYears = append(b.PubYears, ClampUint16(w.PublicationYear))
 	b.PubDates = append(b.PubDates, pubDatePtr)
-	b.CreatedDates = append(b.CreatedDates, createdDate)
 	b.UpdatedDates = append(b.UpdatedDates, updatedDate)
 
 	b.WorkTypes = append(b.WorkTypes, w.Type)
-	b.Languages = append(b.Languages, w.Language)
-	b.IsRetracted = append(b.IsRetracted, boolToUint8(w.IsRetracted))
-	b.CitedByCounts = append(b.CitedByCounts, ClampUint32(w.CitedByCount))
-	b.RefWorksCounts = append(b.RefWorksCounts, ClampUint32(w.ReferencedWorksCount))
-	b.AuthorsCounts = append(b.AuthorsCounts, authorsCount)
+	b.IsRetracted = append(b.IsRetracted, boolToUint8(derefBool(w.IsRetracted)))
 	b.FWCIs = append(b.FWCIs, fwciPtr)
 
 	b.PrimaryTopicIDs = append(b.PrimaryTopicIDs, pTopicID)
-	b.PrimaryTopicScores = append(b.PrimaryTopicScores, pTopicScore)
-	b.PrimarySubfieldIDs = append(b.PrimarySubfieldIDs, pSubfieldID)
 	b.PrimaryFieldIDs = append(b.PrimaryFieldIDs, pFieldID)
-	b.PrimaryDomainIDs = append(b.PrimaryDomainIDs, pDomainID)
 	b.PrimarySourceIDs = append(b.PrimarySourceIDs, pSourceID)
 	b.PrimarySourceTypes = append(b.PrimarySourceTypes, pSourceType)
-	b.PrimaryIsOA = append(b.PrimaryIsOA, pIsOA)
 
-	b.FirstAuthorCountries = append(b.FirstAuthorCountries, firstCountry)
-	b.CountryCodes = append(b.CountryCodes, countries)
-	b.AuthorIDs = append(b.AuthorIDs, authorIDs)
-	b.InstitutionIDs = append(b.InstitutionIDs, instIDs)
 	b.TopicIDs = append(b.TopicIDs, topicIDs)
 	b.TopicScores = append(b.TopicScores, topicScores)
-	b.Keywords = append(b.Keywords, keywords)
-	b.CitedByYears = append(b.CitedByYears, citedYears)
-	b.CitedByYearCounts = append(b.CitedByYearCounts, citedCounts)
 
 	return OutcomeAdded
 }
@@ -415,102 +351,6 @@ func AppendParquetInstitution(inst *ParquetInstitution, b *sink.InstitutionsBatc
 	return true
 }
 
-func extractParquetAuthorships(auths []ParquetWorkAuthorship) (firstCountry string, countries []string, authorIDs []uint64, instIDs []uint64) {
-	if len(auths) == 0 {
-		return "", nil, nil, nil
-	}
-	authorIDs = make([]uint64, 0, len(auths))
-
-	for i := range auths {
-		a := &auths[i]
-		isFirst := derefString(a.AuthorPosition) == "first" || (i == 0 && firstCountry == "")
-
-		if a.Author != nil {
-			if aid := ParseAuthorID(derefString(a.Author.ID)); aid != 0 {
-				authorIDs = append(authorIDs, aid)
-			}
-		}
-		for _, rawCC := range a.Countries {
-			cc := NormalizeCountryCode(rawCC)
-			if cc == "" {
-				continue
-			}
-			if isFirst && firstCountry == "" {
-				firstCountry = cc
-			}
-			if !slices.Contains(countries, cc) {
-				countries = append(countries, cc)
-			}
-		}
-		for j := range a.Institutions {
-			inst := &a.Institutions[j]
-			if iid := ParseInstitutionID(derefString(inst.ID)); iid != 0 && !slices.Contains(instIDs, iid) {
-				instIDs = append(instIDs, iid)
-			}
-			if cc := NormalizeCountryCode(derefString(inst.CountryCode)); cc != "" {
-				if isFirst && firstCountry == "" {
-					firstCountry = cc
-				}
-				if !slices.Contains(countries, cc) {
-					countries = append(countries, cc)
-				}
-			}
-		}
-	}
-	if len(authorIDs) == 0 {
-		authorIDs = nil
-	}
-	return firstCountry, countries, authorIDs, instIDs
-}
-
-func extractJSONAuthorships(auths []JSONAuthorship) (firstCountry string, countries []string, authorIDs []uint64, instIDs []uint64) {
-	if len(auths) == 0 {
-		return "", nil, nil, nil
-	}
-	authorIDs = make([]uint64, 0, len(auths))
-
-	for i := range auths {
-		a := &auths[i]
-		isFirst := a.AuthorPosition == "first" || (i == 0 && firstCountry == "")
-
-		if a.Author != nil {
-			if aid := ParseAuthorID(a.Author.ID); aid != 0 {
-				authorIDs = append(authorIDs, aid)
-			}
-		}
-		for _, rawCC := range a.Countries {
-			cc := NormalizeCountryCode(rawCC)
-			if cc == "" {
-				continue
-			}
-			if isFirst && firstCountry == "" {
-				firstCountry = cc
-			}
-			if !slices.Contains(countries, cc) {
-				countries = append(countries, cc)
-			}
-		}
-		for j := range a.Institutions {
-			inst := &a.Institutions[j]
-			if iid := ParseInstitutionID(inst.ID); iid != 0 && !slices.Contains(instIDs, iid) {
-				instIDs = append(instIDs, iid)
-			}
-			if cc := NormalizeCountryCode(inst.CountryCode); cc != "" {
-				if isFirst && firstCountry == "" {
-					firstCountry = cc
-				}
-				if !slices.Contains(countries, cc) {
-					countries = append(countries, cc)
-				}
-			}
-		}
-	}
-	if len(authorIDs) == 0 {
-		authorIDs = nil
-	}
-	return firstCountry, countries, authorIDs, instIDs
-}
-
 func extractParquetTopics(topics []ParquetWorkTopic) ([]uint32, []float32) {
 	if len(topics) == 0 {
 		return nil, nil
@@ -518,10 +358,14 @@ func extractParquetTopics(topics []ParquetWorkTopic) ([]uint32, []float32) {
 	ids := make([]uint32, 0, len(topics))
 	scores := make([]float32, 0, len(topics))
 	for i := range topics {
-		if tid := ParseTopicID(derefString(topics[i].ID)); tid != 0 {
-			ids = append(ids, tid)
-			scores = append(scores, derefFloat32(topics[i].Score))
+		tid := ParseTopicID(derefString(topics[i].ID))
+		if tid == 0 || slices.Contains(ids, tid) {
+			// Duplicate topic ids keep the first occurrence and its score
+			// (round-2 answer Q2); the repeat never overrides it.
+			continue
 		}
+		ids = append(ids, tid)
+		scores = append(scores, normalizeTopicScore(derefFloat32(topics[i].Score)))
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -536,10 +380,12 @@ func extractJSONTopics(topics []JSONWorkTopic) ([]uint32, []float32) {
 	ids := make([]uint32, 0, len(topics))
 	scores := make([]float32, 0, len(topics))
 	for i := range topics {
-		if tid := ParseTopicID(topics[i].ID); tid != 0 {
-			ids = append(ids, tid)
-			scores = append(scores, topics[i].Score)
+		tid := ParseTopicID(topics[i].ID)
+		if tid == 0 || slices.Contains(ids, tid) {
+			continue
 		}
+		ids = append(ids, tid)
+		scores = append(scores, normalizeTopicScore(topics[i].Score))
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -547,70 +393,11 @@ func extractJSONTopics(topics []JSONWorkTopic) ([]uint32, []float32) {
 	return ids, scores
 }
 
-func extractParquetKeywords(kws []ParquetWorkKeyword) []string {
-	if len(kws) == 0 {
-		return nil
+func normalizeTopicScore(v float32) float32 {
+	if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) || v < 0 {
+		return 0
 	}
-	out := make([]string, 0, len(kws))
-	for i := range kws {
-		kw := NormalizeKeyword(derefString(kws[i].DisplayName))
-		if kw != "" && !slices.Contains(out, kw) {
-			out = append(out, kw)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func extractJSONKeywords(kws []JSONWorkKeyword) []string {
-	if len(kws) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(kws))
-	for i := range kws {
-		kw := NormalizeKeyword(kws[i].DisplayName)
-		if kw != "" && !slices.Contains(out, kw) {
-			out = append(out, kw)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-func extractParquetCountsByYear(cby []ParquetYearCount) ([]uint16, []uint32) {
-	if len(cby) == 0 {
-		return nil, nil
-	}
-	years := make([]uint16, 0, len(cby))
-	counts := make([]uint32, 0, len(cby))
-	for i := range cby {
-		if cby[i].Year == nil {
-			continue
-		}
-		years = append(years, ClampUint16(*cby[i].Year))
-		counts = append(counts, ClampUint32(derefInt32(cby[i].CitedByCount)))
-	}
-	if len(years) == 0 {
-		return nil, nil
-	}
-	return years, counts
-}
-
-func extractJSONCountsByYear(cby []JSONYearCount) ([]uint16, []uint32) {
-	if len(cby) == 0 {
-		return nil, nil
-	}
-	years := make([]uint16, 0, len(cby))
-	counts := make([]uint32, 0, len(cby))
-	for i := range cby {
-		years = append(years, ClampUint16(cby[i].Year))
-		counts = append(counts, ClampUint32(cby[i].CitedByCount))
-	}
-	return years, counts
+	return v
 }
 
 func derefString(p *string) string {

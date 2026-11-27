@@ -87,24 +87,24 @@ func TestProcessWorksFileFullGetAndRangeParity(t *testing.T) {
 	t.Parallel()
 	csTopic := &normalizer.ParquetPrimaryTopic{
 		ID:    testPtr("https://openalex.org/T12799"),
-		Score: testPtr(float32(0.9)),
 		Field: &normalizer.ParquetIDRef{ID: testPtr("https://openalex.org/fields/17")},
 	}
 	bioTopic := &normalizer.ParquetPrimaryTopic{
 		ID:    testPtr("https://openalex.org/T10089"),
-		Score: testPtr(float32(0.8)),
 		Field: &normalizer.ParquetIDRef{ID: testPtr("https://openalex.org/fields/23")},
 	}
 
 	rows := make([]normalizer.ParquetWork, 0, 12)
 	for i := range 6 {
 		rows = append(rows, normalizer.ParquetWork{
-			ID:                    testPtr(fmt.Sprintf("https://openalex.org/W%d", 1000+i)),
-			Title:                 testPtr(fmt.Sprintf("CS Paper %d", i)),
-			PublicationYear:       testPtr(int32(2020 + i)),
-			IsXPAC:                testPtr(false),
-			PrimaryTopic:          csTopic,
-			AbstractInvertedIndex: testPtr(`{"go":[0],"etl":[1]}`),
+			ID:              testPtr(fmt.Sprintf("https://openalex.org/W%d", 1000+i)),
+			Type:            testPtr("article"),
+			UpdatedDate:     testPtr(int64(1_791_946_884_000_000)),
+			IsRetracted:     testPtr(false),
+			PublicationYear: testPtr(int32(2020 + i)),
+			IsXPAC:          testPtr(false),
+			PrimaryTopic:    csTopic,
+			Topics:          []normalizer.ParquetWorkTopic{{ID: testPtr("https://openalex.org/T10108")}},
 		})
 	}
 	rows = append(rows, rows[0])
@@ -118,7 +118,7 @@ func TestProcessWorksFileFullGetAndRangeParity(t *testing.T) {
 	for i := range 3 {
 		rows = append(rows, normalizer.ParquetWork{
 			ID:           testPtr(fmt.Sprintf("https://openalex.org/W%d", 3000+i)),
-			IsXPAC:       testPtr(false),
+			IsXPAC:          testPtr(false),
 			PrimaryTopic: bioTopic,
 		})
 	}
@@ -236,16 +236,18 @@ func TestProcessWorksFileMaxRecords(t *testing.T) {
 
 	csTopic := &normalizer.ParquetPrimaryTopic{
 		ID:    testPtr("https://openalex.org/T12799"),
-		Score: testPtr(float32(0.9)),
 		Field: &normalizer.ParquetIDRef{ID: testPtr("https://openalex.org/fields/17")},
 	}
 	rows := make([]normalizer.ParquetWork, 0, 5)
 	for i := range 5 {
 		rows = append(rows, normalizer.ParquetWork{
-			ID:           testPtr(fmt.Sprintf("https://openalex.org/W%d", 5000+i)),
-			Title:        testPtr(fmt.Sprintf("CS Paper %d", i)),
-			IsXPAC:       testPtr(false),
-			PrimaryTopic: csTopic,
+			ID:              testPtr(fmt.Sprintf("https://openalex.org/W%d", 5000+i)),
+			Type:            testPtr("article"),
+			UpdatedDate:     testPtr(int64(1_791_946_884_000_000)),
+			IsRetracted:     testPtr(false),
+			PublicationYear: testPtr(int32(2020)),
+			IsXPAC:          testPtr(false),
+			PrimaryTopic:    csTopic,
 		})
 	}
 	raw := buildParquetBytes(t, rows)
@@ -279,3 +281,4 @@ func TestProcessWorksFileMaxRecords(t *testing.T) {
 		t.Fatalf("scanned %d < written %d", res.ScannedRows, res.WrittenRows)
 	}
 }
+

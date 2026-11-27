@@ -45,10 +45,12 @@ type Snapshot struct {
 	Kind  string `json:"kind"`
 	State State  `json:"state"`
 
-	ScannedRecords uint64 `json:"scanned_records"`
-	MatchedRecords uint64 `json:"matched_records"`
-	WrittenRecords uint64 `json:"written_records"`
-	DedupDropped   uint64 `json:"dedup_dropped"`
+	ScannedRecords   uint64            `json:"scanned_records"`
+	MatchedRecords   uint64            `json:"matched_records"`
+	WrittenRecords   uint64            `json:"written_records"`
+	DedupDropped     uint64            `json:"dedup_dropped"`
+	RejectedRecords  uint64            `json:"rejected_records"`
+	RejectedByReason map[string]uint64 `json:"rejected_by_reason,omitempty"`
 
 	BytesRead    uint64 `json:"bytes_read"`
 	HTTPRequests uint64 `json:"http_requests"`
@@ -147,23 +149,25 @@ func (j *Job) Snapshot() Snapshot {
 	}
 
 	return Snapshot{
-		JobID:          j.id,
-		Kind:           string(j.kind),
-		State:          state,
-		ScannedRecords: m.ScannedRecords,
-		MatchedRecords: m.MatchedRecords,
-		WrittenRecords: m.WrittenRecords,
-		DedupDropped:   m.DedupDropped,
-		BytesRead:      m.BytesRead,
-		HTTPRequests:   m.HTTPRequests,
-		ElapsedSec:     elapsed,
-		CurrentRPS:     m.CurrentRPS,
-		AvgBatchMs:     m.AvgBatchMs,
-		P50BatchMs:     m.P50BatchMs,
-		P95BatchMs:     m.P95BatchMs,
-		P99BatchMs:     m.P99BatchMs,
-		CurrentItem:    m.CurrentItem,
-		Error:          errText,
+		JobID:            j.id,
+		Kind:             string(j.kind),
+		State:            state,
+		ScannedRecords:   m.ScannedRecords,
+		MatchedRecords:   m.MatchedRecords,
+		WrittenRecords:   m.WrittenRecords,
+		DedupDropped:     m.DedupDropped,
+		RejectedRecords:  m.RejectedRecords,
+		RejectedByReason: m.RejectedByReason,
+		BytesRead:        m.BytesRead,
+		HTTPRequests:     m.HTTPRequests,
+		ElapsedSec:       elapsed,
+		CurrentRPS:       m.CurrentRPS,
+		AvgBatchMs:       m.AvgBatchMs,
+		P50BatchMs:       m.P50BatchMs,
+		P95BatchMs:       m.P95BatchMs,
+		P99BatchMs:       m.P99BatchMs,
+		CurrentItem:      m.CurrentItem,
+		Error:            errText,
 	}
 }
 
