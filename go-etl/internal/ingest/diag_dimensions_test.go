@@ -1,4 +1,4 @@
-﻿//go:build inspect
+//go:build inspect
 
 package ingest
 

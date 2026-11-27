@@ -84,3 +84,11 @@ func TestSnapshotChangedCarriesRestartToken(t *testing.T) {
 		t.Fatalf("restart_token = %q, want tok-1", snap.RestartToken)
 	}
 }
+
+func TestCorpusIncompleteCode(t *testing.T) {
+	t.Parallel()
+	err := fmt.Errorf("%w: 3 of 100 file(s) failed", pipeline.ErrCorpusIncomplete)
+	if got := ErrorCode(err); got != CodeCorpusIncomplete {
+		t.Fatalf("ErrorCode = %q, want %q", got, CodeCorpusIncomplete)
+	}
+}

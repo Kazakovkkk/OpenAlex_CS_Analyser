@@ -1,4 +1,4 @@
-﻿package api
+package api
 
 import (
 	"context"
@@ -117,7 +117,7 @@ func (c *Client) IterateWorks(ctx context.Context, q WorksQuery, fn func(raw []b
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		if stats.Pages > 0 && c.opts.APIKey == "" {
+		if stats.Pages > 0 && c.apiKey() == "" {
 			return stats, ErrAPIKeyRequired
 		}
 		if _, dup := seenCursors[cursor]; dup {

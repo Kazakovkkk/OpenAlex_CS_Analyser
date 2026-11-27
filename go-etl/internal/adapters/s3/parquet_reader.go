@@ -54,6 +54,9 @@ type ParquetReadOptions struct {
 	// file). It exists for the REST contract's max_records: without it a demo
 	// request "give me 100 rows from S3" would download 587 files.
 	MaxRecords int64
+	// Budget, when set, is the shared job-level row budget: it makes the cap
+	// exact even when several files are read concurrently.
+	Budget *RowBudget
 }
 
 func DefaultParquetReadOptions() ParquetReadOptions {
@@ -254,11 +257,23 @@ func ProcessWorksFile(
 				switch outcome {
 				case normalizer.OutcomeAdded:
 					batchMatched++
-					// max_records is a row-level cap: stop as soon as enough rows were
-					// accepted, not after a whole 256-row page and not after the file.
-					if opts.MaxRecords > 0 && res.WrittenRows+uint64(batch.Len()) >= uint64(opts.MaxRecords) {
+					if opts.Budget != nil && !opts.Budget.Take() {
+						// The row was appended optimistically; give it back so the
+						// job never writes more than max_records.
+						batch.Trim(batch.Len() - 1)
+						batchMatched--
 						res.Truncated = true
 						break rows
+					}
+					// max_records is a row-level cap: trim the batch so exactly the
+					// requested number of rows is written, then stop the file.
+					if opts.MaxRecords > 0 {
+						left := int(uint64(opts.MaxRecords) - res.WrittenRows)
+						if left < batch.Len() {
+							batch.Trim(left)
+							res.Truncated = true
+							break rows
+						}
 					}
 					if batch.Len() >= batchSize {
 						written, err := flushWorksBatch(ctx, outSink, batch, opts.Metrics)

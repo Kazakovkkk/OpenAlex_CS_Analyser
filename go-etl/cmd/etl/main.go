@@ -53,6 +53,10 @@ func main() {
 		err = runSyncDims(ctx, logger, os.Args[2:])
 	case "loadtest":
 		err = runLoadtest(ctx, logger, os.Args[2:])
+	case "bench":
+		err = runBench(ctx, logger, os.Args[2:])
+	case "sample":
+		err = runSample(ctx, logger, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -216,6 +220,7 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	batchSize := fs.Int("batch-size", sink.DefaultBatchCap, "rows per batch")
 	shardIndex := fs.Int("shard-index", 0, "shard index (0-based)")
 	shardTotal := fs.Int("shard-total", 1, "number of shards")
+	shard := fs.String("shard", "", "shard as k/N (1-based), an alternative to --shard-index/--shard-total")
 	maxFiles := fs.Int("max-files", 0, "limit the number of files (0 = all)")
 	maxRecords := fs.Int("max-records", 0, "limit the number of records (0 = all)")
 	fromDate := fs.String("from-date", "", "YYYY-MM-DD lower bound for the API source")
@@ -259,9 +264,21 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	}, logger)
 	manager := jobs.NewManager()
 
+	resolvedShardIndex, resolvedShardTotal := *shardIndex, *shardTotal
+	if *shard != "" {
+		idx, total, serr := parseShard(*shard)
+		if serr != nil {
+			return serr
+		}
+		if *shardIndex != 0 || *shardTotal != 1 {
+			return fmt.Errorf("--shard cannot be combined with --shard-index/--shard-total")
+		}
+		resolvedShardIndex, resolvedShardTotal = idx, total
+	}
+
 	req := httpapi.IngestRequest{
 		Source: *source, Workers: *workers, BatchSize: *batchSize,
-		ShardIndex: *shardIndex, ShardTotal: *shardTotal, MaxFiles: *maxFiles,
+		ShardIndex: resolvedShardIndex, ShardTotal: resolvedShardTotal, MaxFiles: *maxFiles,
 		FromDate: *fromDate, DateFilterMode: *dateMode,
 		APIKey: resolvedKey, RPSLimit: *rpsLimit, MaxRecords: *maxRecords,
 	}

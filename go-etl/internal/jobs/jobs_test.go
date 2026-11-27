@@ -2,7 +2,9 @@ package jobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -240,4 +242,39 @@ func TestRunningOfKind(t *testing.T) {
 	if got := m.RunningOfKind(KindIngest); got != nil {
 		t.Fatalf("RunningOfKind after stop = %s, want nil", got.ID())
 	}
+}
+
+func TestSnapshotCarriesLiveRates(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+	j, err := m.Start(t.Context(), KindIngest, func(_ context.Context, job *Job) error {
+		job.Metrics().AddScanned(1000)
+		job.Metrics().AddWritten(500, 4096)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	<-j.Done()
+
+	snap := j.Snapshot()
+	if snap.ScannedRecords != 1000 || snap.WrittenRecords != 500 {
+		t.Fatalf("counters = %d/%d", snap.ScannedRecords, snap.WrittenRecords)
+	}
+	if snap.ElapsedSec < 0 {
+		t.Fatal("negative elapsed")
+	}
+	// The live rate fields must be present in the JSON contract.
+	if !strings.Contains(mustJSON(t, snap), "scan_rps") {
+		t.Fatal("snapshot JSON lacks scan_rps")
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
 }

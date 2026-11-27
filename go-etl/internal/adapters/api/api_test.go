@@ -466,3 +466,16 @@ func TestDefaultWorksSelectIsValid(t *testing.T) {
 		t.Fatal("authorships must be selected: authors_count is computed from it")
 	}
 }
+
+func TestRPSLimitIsCapped(t *testing.T) {
+	t.Parallel()
+	if got := (Options{RPSLimit: 500}).withDefaults().RPSLimit; got != MaxRPS {
+		t.Fatalf("capped rate = %v, want %v", got, MaxRPS)
+	}
+	if got := (Options{RPSLimit: 5}).withDefaults().RPSLimit; got != 5 {
+		t.Fatalf("a lower rate must be kept, got %v", got)
+	}
+	if got := (Options{}).withDefaults().RPSLimit; got != DefaultRPS {
+		t.Fatalf("default rate = %v, want %v", got, DefaultRPS)
+	}
+}

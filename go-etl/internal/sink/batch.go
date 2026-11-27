@@ -87,6 +87,38 @@ func (b *WorksBatch) Len() int {
 	return len(b.WorkIDs)
 }
 
+// Trim keeps the first n rows, so a row-level cap is enforced exactly.
+func (b *WorksBatch) Trim(n int) {
+	if n < 0 || n >= b.Len() {
+		return
+	}
+	b.WorkIDs = b.WorkIDs[:n]
+	b.UpdatedDates = b.UpdatedDates[:n]
+	for i := range b.WorkTypes[:n] {
+		b.WorkTypes[i] = ""
+	}
+	b.WorkTypes = b.WorkTypes[:n]
+	b.PrimaryFieldIDs = b.PrimaryFieldIDs[:n]
+	b.IsRetracted = b.IsRetracted[:n]
+	b.PubYears = b.PubYears[:n]
+	b.PubDates = b.PubDates[:n]
+	b.PrimaryTopicIDs = b.PrimaryTopicIDs[:n]
+	for i := range b.TopicIDs[:n] {
+		b.TopicIDs[i] = nil
+	}
+	b.TopicIDs = b.TopicIDs[:n]
+	for i := range b.TopicScores[:n] {
+		b.TopicScores[i] = nil
+	}
+	b.TopicScores = b.TopicScores[:n]
+	b.PrimarySourceIDs = b.PrimarySourceIDs[:n]
+	for i := range b.PrimarySourceTypes[:n] {
+		b.PrimarySourceTypes[i] = ""
+	}
+	b.PrimarySourceTypes = b.PrimarySourceTypes[:n]
+	b.FWCIs = b.FWCIs[:n]
+}
+
 func (b *WorksBatch) Reset() {
 	b.WorkIDs = b.WorkIDs[:0]
 	b.UpdatedDates = b.UpdatedDates[:0]

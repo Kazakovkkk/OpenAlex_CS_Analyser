@@ -1,4 +1,4 @@
-﻿package api
+package api
 
 import (
 	"context"
@@ -42,14 +42,25 @@ func (c *Client) RequestAPIKey(ctx context.Context, email string) (APIKeyResult,
 		out.Message = "request accepted"
 	}
 	if out.APIKey != "" {
-		c.opts.APIKey = out.APIKey
+		c.SetAPIKey(out.APIKey)
 	}
 	return out, nil
 }
 
-func (c *Client) SetAPIKey(key string) { c.opts.APIKey = strings.TrimSpace(key) }
+// apiKey returns the key under the read lock.
+func (c *Client) apiKey() string {
+	c.keyMu.RLock()
+	defer c.keyMu.RUnlock()
+	return c.opts.APIKey
+}
 
-func (c *Client) HasAPIKey() bool { return c.opts.APIKey != "" }
+func (c *Client) SetAPIKey(key string) {
+	c.keyMu.Lock()
+	c.opts.APIKey = strings.TrimSpace(key)
+	c.keyMu.Unlock()
+}
+
+func (c *Client) HasAPIKey() bool { return c.apiKey() != "" }
 
 func (c *Client) String() string {
 	return fmt.Sprintf("openalex api %s (rps %.1f, key=%t)", c.opts.BaseURL, c.opts.RPSLimit, c.opts.APIKey != "")

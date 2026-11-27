@@ -20,5 +20,8 @@ tmp/
 .DS_Store
 .idea/
 .vscode/
-*.txt
+
+# Reports are deliverables now: they must be committed, so docs/ is NOT ignored.
+# Only ad-hoc scratch notes and secrets stay out of the repository.
 docs/
+*.txt

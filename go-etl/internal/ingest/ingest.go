@@ -226,6 +226,10 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 		return int64(uint64(opts.MaxRecords) - done)
 	}
 
+	if bs, ok := p.(interface{ SetRowBudget(*s3.RowBudget) }); ok && opts.MaxRecords > 0 {
+		bs.SetRowBudget(s3.NewRowBudget(opts.MaxRecords))
+	}
+
 	worker := func() {
 		defer wg.Done()
 		for entry := range files {

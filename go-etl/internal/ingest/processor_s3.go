@@ -1,4 +1,4 @@
-﻿package ingest
+package ingest
 
 import (
 	"context"
@@ -17,7 +17,11 @@ type S3WorksProcessor struct {
 	Sink        sink.BatchSink
 	Metrics     *metrics.JobMetrics
 	ReadOptions s3.ParquetReadOptions
+	budget      *s3.RowBudget
 }
+
+// SetRowBudget installs the job-level row budget shared by every worker.
+func (p *S3WorksProcessor) SetRowBudget(b *s3.RowBudget) { p.budget = b }
 
 func (p *S3WorksProcessor) Process(ctx context.Context, entry Entry, limit int64) (FileResult, error) {
 	if p == nil || p.Client == nil {
@@ -28,6 +32,7 @@ func (p *S3WorksProcessor) Process(ctx context.Context, entry Entry, limit int64
 		opts.Metrics = p.Metrics
 	}
 	opts.MaxRecords = limit // job-level row budget handed down by the orchestrator
+	opts.Budget = p.budget
 	return s3.ProcessWorksFile(ctx, p.Client, entry, p.Normalizer, p.Pool, p.Sink, opts)
 }
 

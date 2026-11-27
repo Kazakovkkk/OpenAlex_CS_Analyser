@@ -217,3 +217,24 @@ func ParseS3URL(raw string) (bucket, key string, err error) {
 	}
 	return bucket, key, nil
 }
+
+// StatURL describes one s3:// object without downloading it.
+func (c *Client) StatURL(ctx context.Context, url string) (ManifestEntry, error) {
+	prefix := "s3://" + c.bucket + "/"
+	key, ok := strings.CutPrefix(strings.TrimSpace(url), prefix)
+	if !ok || key == "" {
+		return ManifestEntry{}, fmt.Errorf("s3: expected %s<key>, got %q", prefix, url)
+	}
+	out, err := c.api.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: &c.bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return ManifestEntry{}, fmt.Errorf("s3: head %s: %w", key, err)
+	}
+	entry := ManifestEntry{URL: strings.TrimSpace(url)}
+	if out.ContentLength != nil {
+		entry.Meta.ContentLength = *out.ContentLength
+	}
+	return entry, nil
+}

@@ -58,6 +58,12 @@ type Snapshot struct {
 
 	ElapsedSec float64 `json:"elapsed_sec"`
 	CurrentRPS float64 `json:"current_rps"`
+	// Live rates: they move while the load runs, so the TUI can show progress
+	// instead of waiting for the final report.
+	ScanRPS        float64 `json:"scan_rps"`
+	ScanMBPerSec   float64 `json:"scan_mb_per_sec"`
+	IngestMBPerSec float64 `json:"ingest_mb_per_sec"`
+	BatchesWritten uint64  `json:"batches_written"`
 
 	AvgBatchMs float64 `json:"avg_batch_ms"`
 	P50BatchMs float64 `json:"p50_batch_ms"`
@@ -172,6 +178,10 @@ func (j *Job) Snapshot() Snapshot {
 		HTTPRequests:     m.HTTPRequests,
 		ElapsedSec:       elapsed,
 		CurrentRPS:       m.CurrentRPS,
+		ScanRPS:          m.ScanRPS,
+		ScanMBPerSec:     m.ScanMBPerSec,
+		IngestMBPerSec:   m.IngestMBPerSec,
+		BatchesWritten:   m.BatchesWritten,
 		AvgBatchMs:       m.AvgBatchMs,
 		P50BatchMs:       m.P50BatchMs,
 		P95BatchMs:       m.P95BatchMs,

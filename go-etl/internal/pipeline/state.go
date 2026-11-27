@@ -20,6 +20,9 @@ var (
 	ErrRevisionConflict = errors.New("pipeline: state revision changed under us")
 	ErrLoadInProgress   = errors.New("pipeline: another load is in progress")
 	ErrNotLoading       = errors.New("pipeline: publication without an active load")
+	// ErrCorpusIncomplete means part of the release could not be loaded, so no
+	// version may be published (spec §6.5).
+	ErrCorpusIncomplete = errors.New("pipeline: corpus is incomplete")
 )
 
 type Conn interface {

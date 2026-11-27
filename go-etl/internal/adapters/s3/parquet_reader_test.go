@@ -118,7 +118,7 @@ func TestProcessWorksFileFullGetAndRangeParity(t *testing.T) {
 	for i := range 3 {
 		rows = append(rows, normalizer.ParquetWork{
 			ID:           testPtr(fmt.Sprintf("https://openalex.org/W%d", 3000+i)),
-			IsXPAC:          testPtr(false),
+			IsXPAC:       testPtr(false),
 			PrimaryTopic: bioTopic,
 		})
 	}
@@ -281,4 +281,3 @@ func TestProcessWorksFileMaxRecords(t *testing.T) {
 		t.Fatalf("scanned %d < written %d", res.ScannedRows, res.WrittenRows)
 	}
 }
-

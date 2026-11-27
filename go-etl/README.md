@@ -215,4 +215,41 @@ go test -v -count=1 -tags=inspect ./internal/adapters/s3 -run TestDiagRowGroupLa
 go test -v -count=1 -tags=inspect ./internal/adapters/s3 -run TestBenchPartitionPairedFormats
 ```
 
-Результаты всех замеров — в [docs/stage1-benchmarks.md](docs/stage1-benchmarks.md).
+
+## Публикация версий (`pipeline_state`)
+
+Загрузка не просто пишет строки: она публикует версию набора, которую читает аналитика.
+
+- `BeginLoad` переводит состояние в `loading` и очищает `etl_checkpoints` — прошлые метки не должны пропустить файлы нового набора.
+- `Publish` возвращает `idle`, поднимает `data_version` и ставит `data_updated_at`; при проверке без изменений метаданные остаются прежними.
+- Переходы — compare-and-set по `state_revision`: победила ли наша ревизия, проверяется перечитыванием. Проигрыш гонки — ошибка, а не тихая потеря записи.
+- Поля `analysis_*` принадлежат Python и копируются без изменений.
+- Диагностические прогоны (`--max-files`, `--max-records`, один шард) состояние **не трогают** и чекпоинты **не пишут**.
+
+## Инкрементальные загрузки
+
+- Если набор уже опубликован, загрузка берёт только партиции новее `published snapshot_date` (для снимков до 2026-11-07 — включая день релиза, разово).
+- Перед загрузкой строится индекс известных `work_id` (roaring64, потоковая выгрузка), чтобы отличать новые работы от обновлений.
+- Работа, выпавшая из корпуса (сменился тип или область), записывается новой версией с `primary_field_id = 0`, а не молча фильтруется — иначе аналитика продолжала бы её считать.
+- `deleted_ids.csv.gz` читается потоком; удаляются только те ID, что реально есть в базе, и **до публикации** проверяется, что строки больше не читаются.
+
+## Смена снимка и перезапуск
+
+Если релиз в бакете изменился во время загрузки, версия не публикуется: задача завершается с `error_code = snapshot_changed` и одноразовым `restart_token` (TTL 30 минут). Подтверждение — `POST /api/v1/ingest/restart` с этим токеном: состояние и манифест перепроверяются, `works`/`dim_topics`/`etl_checkpoints` очищаются, загрузка начинается заново. Просроченный, использованный или устаревший токен — `restart_offer_expired`.
+
+## Коды ошибок
+
+`error_code` в статусе задачи: `snapshot_changed`, `restart_offer_expired`, `corpus_incomplete`, `disk_full`, `session_busy`, `auth_failed`, `access_denied`, `clickhouse_unavailable`, `plan_required`, `api_key_required`, `rate_limited`. Неизвестные ошибки кода не имеют — TUI показывает общий текст.
+
+## Команды MVP
+
+```bash
+etl sample --records 12000 --out tmp/works_sample_12k.jsonl.gz   # собрать сэмпл из реальных данных
+etl bench --file s3://openalex/.../part_0071.parquet             # сравнить режимы чтения на одном файле
+etl bench --file ... --full-get-threshold-mb 1000000             # базовая линия: один Full GET
+etl ingest --source s3 --shard 2/4                                # шард в форме k/N
+```
+
+Сэмпл нужен нагрузочному тесту (`--sample`); он собирается из настоящих записей OpenAlex, а не генерируется синтетически.
+
+

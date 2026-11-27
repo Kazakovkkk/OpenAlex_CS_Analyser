@@ -166,7 +166,8 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 	}
 
 	a.logger.Info("ingest: starting", "job", j.ID(), "files", len(entries),
-		"shard", req.ShardIndex, "of", req.ShardTotal, "snapshot_bytes", manifest.ContentLength)
+		"shard", req.ShardIndex, "of", req.ShardTotal,
+		"snapshot_bytes", ingest.SelectionBytes(entries))
 
 	batchSize := req.BatchSize
 	if batchSize <= 0 {
@@ -260,8 +261,11 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 	if res.Stopped {
 		return nil
 	}
-	if res.FilesDone == 0 && res.FilesFailed > 0 {
-		return fmt.Errorf("app: all %d files failed (like the first: %v)", res.FilesFailed, res.FailedFiles[0].Err)
+	if res.FilesFailed > 0 {
+		// A failed file means the corpus is not complete: the version must not be
+		// published, and the state stays `loading` for the next attempt.
+		return fmt.Errorf("%w: %d of %d file(s) failed, nothing was published",
+			pipeline.ErrCorpusIncomplete, res.FilesFailed, res.FilesDone+res.FilesFailed)
 	}
 	if !usePipeline && ledger == nil && res.FilesDone == 0 && res.FilesSkipped > 0 {
 		return fmt.Errorf("app: all %d selected file(s) were already processed according to checkpoint %q; "+
@@ -476,12 +480,12 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 	batch := pool.Get()
 	defer pool.Put(batch)
 
-	flush := func() error {
+	flush := func(fctx context.Context) error {
 		if batch.Len() == 0 {
 			return nil
 		}
 		start := time.Now()
-		if err := a.cfg.Sink.WriteWorksBatch(ctx, batch); err != nil {
+		if err := a.cfg.Sink.WriteWorksBatch(fctx, batch); err != nil {
 			return fmt.Errorf("app: write api batch: %w", err)
 		}
 		j.Metrics().RecordBatchDuration(time.Since(start))
@@ -503,11 +507,15 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 			j.Metrics().AddDedupDropped(1)
 		}
 		if batch.Len() >= batchSize {
-			return flush()
+			return flush(ctx)
 		}
 		return nil
 	})
-	if ferr := flush(); ferr != nil && err == nil {
+	// A stopped job still flushes what it already read: the job context is
+	// cancelled, so the final write gets its own short deadline.
+	finalCtx, cancelFinal := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancelFinal()
+	if ferr := flush(finalCtx); ferr != nil && err == nil {
 		err = ferr
 	}
 	if stats.Bytes > 0 {
@@ -582,6 +590,11 @@ func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.Dimens
 			snapDate = *cur.SnapshotDate
 		}
 		changed = cur.ManifestID != manifestID
+		if !changed && !req.ForceReload && cur.Published() {
+			a.logger.Info("sync-dims: the dictionary is already published, skipping",
+				"job", j.ID(), "manifest_id", manifestID)
+			return nil
+		}
 		if _, berr := a.cfg.Pipeline.BeginLoad(ctx, pipeline.BeginParams{
 			InstanceID:   a.cfg.InstanceID,
 			JobID:        j.ID(),

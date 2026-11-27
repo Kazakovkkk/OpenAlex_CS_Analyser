@@ -206,19 +206,26 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 			if batch.Len() == 0 {
 				continue
 			}
+			// A deadline hit must not drop the rows already in the batch: the job
+			// context is cancelled, so the final write gets its own deadline.
+			writeCtx := runCtx
+			var flushCancel context.CancelFunc
 			if err := limiter.WaitN(runCtx, batch.Len()); err != nil {
 				deadlineHit.Store(true)
-				break
+				writeCtx, flushCancel = context.WithTimeout(context.WithoutCancel(runCtx), 15*time.Second)
 			}
 
 			flushStart := time.Now()
-			if err := out.WriteWorksBatch(runCtx, batch); err != nil {
+			if err := out.WriteWorksBatch(writeCtx, batch); err != nil {
 				if runCtx.Err() == nil {
 					mu.Lock()
 					if fatalErr == nil {
 						fatalErr = fmt.Errorf("loadtest: sink write: %w", err)
 					}
 					mu.Unlock()
+				}
+				if flushCancel != nil {
+					flushCancel()
 				}
 				break
 			}
@@ -241,6 +248,11 @@ func RunWithRecords(ctx context.Context, cfg Config, records [][]byte, out sink.
 			deduped += batchDedup
 			rejected += batchRejected
 			mu.Unlock()
+
+			if flushCancel != nil {
+				flushCancel()
+				break
+			}
 
 			select {
 			case <-runCtx.Done():

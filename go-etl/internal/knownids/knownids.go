@@ -1,5 +1,3 @@
-// Package knownids holds the set of work_ids already stored in ClickHouse, so a
-// load can tell a new record from an update of a known one without querying per batch.
 package knownids
 
 import (

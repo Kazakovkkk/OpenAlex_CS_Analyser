@@ -49,6 +49,8 @@ func ErrorCode(err error) string {
 		return CodeSnapshotChanged
 	}
 	switch {
+	case errors.Is(err, pipeline.ErrCorpusIncomplete):
+		return CodeCorpusIncomplete
 	case errors.Is(err, pipeline.ErrRestartOfferExpired):
 		return CodeRestartOfferExpired
 	case errors.Is(err, api.ErrPlanRequired):

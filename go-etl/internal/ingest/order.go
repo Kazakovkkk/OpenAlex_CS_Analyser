@@ -53,6 +53,16 @@ func bySizeAsc(a, b Entry) int {
 
 func bySizeDesc(a, b Entry) int { return -bySizeAsc(a, b) }
 
+// SelectionBytes is the volume of the selected files: the snapshot size must be
+// the sum of the parts, not the header field of the manifest (spec §6.15).
+func SelectionBytes(entries []Entry) int64 {
+	var total int64
+	for i := range entries {
+		total += entries[i].Meta.ContentLength
+	}
+	return total
+}
+
 var updateCatchUpCutoff = time.Date(2026, 11, 7, 0, 0, 0, 0, time.UTC)
 
 func UpdateFrom(published time.Time) time.Time {

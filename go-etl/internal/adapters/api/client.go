@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,8 +22,10 @@ import (
 )
 
 const (
-	DefaultBaseURL  = "https://api.openalex.org"
-	DefaultRPS      = 10.0
+	DefaultBaseURL = "https://api.openalex.org"
+	DefaultRPS     = 10.0
+	// MaxRPS is the contract ceiling for the whole service (spec §6.8).
+	MaxRPS          = 30.0
 	DefaultBurst    = 2
 	DefaultAttempts = 5
 
@@ -59,6 +62,11 @@ func (o Options) withDefaults() Options {
 	if o.RPSLimit <= 0 {
 		o.RPSLimit = DefaultRPS
 	}
+	// The MVP contract caps the request rate at 30 rps regardless of what a
+	// caller asks for: exceeding it gets the whole team rate-limited.
+	if o.RPSLimit > MaxRPS {
+		o.RPSLimit = MaxRPS
+	}
 	if o.Burst <= 0 {
 		o.Burst = DefaultBurst
 	}
@@ -88,6 +96,10 @@ type Stats struct {
 type Client struct {
 	opts    Options
 	limiter *rate.Limiter
+
+	// keyMu guards opts.APIKey: a key can be set by a job while other workers
+	// read it for their requests.
+	keyMu sync.RWMutex
 
 	requests  atomic.Uint64
 	retries   atomic.Uint64
@@ -244,8 +256,8 @@ func (c *Client) getJSON(ctx context.Context, path string, params url.Values, ou
 	if params == nil {
 		params = url.Values{}
 	}
-	if c.opts.APIKey != "" {
-		params.Set("api_key", c.opts.APIKey)
+	if c.apiKey() != "" {
+		params.Set("api_key", c.apiKey())
 	}
 	if c.opts.Email != "" {
 		params.Set("mailto", c.opts.Email)
