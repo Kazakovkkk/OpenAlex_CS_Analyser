@@ -1,0 +1,25 @@
+# Конфиг для локального стенда (local/docker-compose.yml).
+#
+# Отличия от дистрибутивного примера: адрес 127.0.0.1 вместо имени сервиса,
+# без TLS. Имена пользователей те же, пароли приходят из окружения:
+#
+#   export CLICKHOUSE_ETL_WRITER_PASSWORD=dev-etl-writer-password
+#   export CLICKHOUSE_GO_WRITER_PASSWORD=dev-go-writer-password
+#
+# Запуск:
+#   docker compose -f local/docker-compose.yml up -d
+#   go run ./cmd/etl ingest --config config/app.local.toml --max-files 1 --max-records 100
+
+[clickhouse]
+host = "127.0.0.1"
+port = 9000
+database = "openalex"
+secure = false
+pipeline_writer_user = "pipeline_writer"
+python_pipeline_writer_password_env = "CLICKHOUSE_PYTHON_WRITER_PASSWORD"
+
+[go_etl]
+base_url = "http://127.0.0.1:8081"
+etl_writer_user = "etl_writer"
+etl_writer_password_env = "CLICKHOUSE_ETL_WRITER_PASSWORD"
+go_pipeline_writer_password_env = "CLICKHOUSE_GO_WRITER_PASSWORD"

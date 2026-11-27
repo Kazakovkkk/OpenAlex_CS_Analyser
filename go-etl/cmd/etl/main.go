@@ -1,4 +1,4 @@
-﻿package main
+package main
 
 import (
 	"context"
@@ -68,16 +68,19 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `go-etl — OpenAlex -> ClickHouse ETL (Stage 1)
+	fmt.Fprint(os.Stderr, `go-etl — OpenAlex -> ClickHouse ETL (MVP)
 
 usage:
-  etl serve     [--addr :8081] [--sample PATH] [--checkpoint-dir DIR]
-  etl ingest    [--source s3|api] [--workers N] [--batch-size N]
+  etl serve     [--config PATH] [--addr :8081] [--sample PATH] [--checkpoint-dir DIR]
+  etl ingest    [--config PATH] [--source s3|api] [--workers N] [--batch-size N]
                 [--shard-index I --shard-total N] [--max-files N] [--max-records N]
-                [--from-date YYYY-MM-DD] [--date-filter-mode updated|created]
+                [--from-date YYYY-MM-DD] [--date-filter-mode updated|created|publication]
                 [--api-key KEY | $OPENALEX_API_KEY] [--rps-limit N]
-  etl sync-dims [--max-files N]
-  etl loadtest  [--target-rps N] [--duration 30] [--workers N] [--batch-size N] [--sample PATH]
+                [--full-get-threshold-mb N] [--checkpoint-dir DIR]
+  etl sync-dims [--config PATH] [--force-reload]
+  etl loadtest  [--config PATH] [--target-rps N] [--duration 30] [--workers N] [--batch-size N] [--sample PATH]
+
+Without --config every batch goes to the diagnostic NoopSink.
 `)
 }
 
@@ -110,6 +113,7 @@ func startCPUProfile(path string) (func(), error) {
 
 func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
 	addr := fs.String("addr", ":8081", "HTTP listen address")
 	sample := fs.String("sample", loadtest.DefaultSamplePath, "local JSONL.gz for the load test")
 	ckDir := fs.String("checkpoint-dir", filepath.Join("tmp", "checkpoints"), "checkpoint directory")
@@ -121,10 +125,16 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
+	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	if err != nil {
+		return fmt.Errorf("sink: %w", err)
+	}
+	defer closeSink()
+
 	backend := app.New(app.Config{
 		S3:            s3Client,
 		API:           api.NewClient(api.Options{APIKey: app.ResolveAPIKey("")}),
-		Sink:          sink.NewNoopSink(),
+		Sink:          snk,
 		APIKey:        app.ResolveAPIKey(""),
 		CheckpointDir: *ckDir,
 		SamplePath:    *sample,
@@ -196,6 +206,7 @@ func runOneJob(ctx context.Context, logger *slog.Logger, manager *jobs.Manager, 
 
 func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
 	source := fs.String("source", "s3", "data source: s3 or api")
 	workers := fs.Int("workers", 4, "parallel file workers")
 	batchSize := fs.Int("batch-size", sink.DefaultBatchCap, "rows per batch")
@@ -223,11 +234,17 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
+	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	if err != nil {
+		return fmt.Errorf("sink: %w", err)
+	}
+	defer closeSink()
+
 	resolvedKey := app.ResolveAPIKey(*apiKey)
 	backend := app.New(app.Config{
 		S3:               s3Client,
 		API:              api.NewClient(api.Options{APIKey: resolvedKey}),
-		Sink:             sink.NewNoopSink(),
+		Sink:             snk,
 		APIKey:           resolvedKey,
 		CheckpointDir:    *ckDir,
 		FullGetThreshold: int64(*fullGetMB) << 20,
@@ -247,6 +264,7 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 
 func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("sync-dims", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
 	force := fs.Bool("force-reload", true, "reload dictionaries even if they look fresh")
 	cpuProfile := fs.String("cpuprofile", "", "write a pprof CPU profile here")
 	if err := fs.Parse(args); err != nil {
@@ -262,7 +280,13 @@ func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error 
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	backend := app.New(app.Config{S3: s3Client, Sink: sink.NewNoopSink()}, logger)
+	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	if err != nil {
+		return fmt.Errorf("sink: %w", err)
+	}
+	defer closeSink()
+
+	backend := app.New(app.Config{S3: s3Client, Sink: snk}, logger)
 	manager := jobs.NewManager()
 	return runOneJob(ctx, logger, manager, jobs.KindDimensions, func(ctx context.Context, j *jobs.Job) error {
 		return backend.RunDimensions(ctx, j, httpapi.DimensionsRequest{ForceReload: *force})

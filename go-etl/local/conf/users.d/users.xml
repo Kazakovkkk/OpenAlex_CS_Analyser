@@ -1,0 +1,17 @@
+<clickhouse>
+  <!--
+    Локальный стенд: единственное, что нельзя задать через SQL, — права
+    администратора для пользователя `default`. Пользователи etl_writer и
+    pipeline_writer создаются в local/init/01-users.sql, потому что гранты
+    нельзя выдать пользователю из users.xml: ClickHouse хранит их в
+    users_xml и отвечает ACCESS_STORAGE_READONLY (проверено на 26.9).
+  -->
+  <users>
+    <default>
+      <access_management>1</access_management>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+    </default>
+  </users>
+</clickhouse>

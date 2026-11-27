@@ -10,6 +10,9 @@ CGO_ENABLED=0 go build -o bin/etl ./cmd/etl
 # HTTP API для python-tui (порт :8081 по контракту ТЗ)
 etl serve --addr :8081 --sample tmp/works_sample_12k.jsonl.gz --checkpoint-dir tmp/checkpoints
 
+# То же, но с записью в ClickHouse (конфиг дистрибутива)
+etl serve --config config/app.toml --addr :8081
+
 # Заливка снапшота из S3 (шарды + чекпоинт; повторный запуск продолжит с места обрыва)
 etl ingest --source s3 --workers 4 --batch-size 10000 \
            --shard-index 0 --shard-total 4 --checkpoint-dir tmp/checkpoints
@@ -34,6 +37,67 @@ go tool pprof -top bin/etl tmp/prof/lt.prof
 
 Порог `Full GET ↔ Range` зависит от канала, поэтому вынесен в флаг:
 `etl ingest --full-get-threshold-mb 8` (по умолчанию — значение библиотеки, 16 MiB).
+
+## ClickHouse: sink, конфиг и локальный стенд
+
+Без `--config` процесс пишет в диагностический `NoopSink` — прежние сценарии
+(диагностика S3, бенчмарки, нагрузочное кольцо) работают как раньше. С `--config`
+каждый батч вставляется в ClickHouse синхронно и `written_records` растёт только
+после подтверждения сервера.
+
+Конфиг — дистрибутивный `config/app.toml`; Go читает из него только `[clickhouse]`
+и `[go_etl]`, секции `[compose]`/`[actions]` и любые будущие ключи игнорируются.
+Паролей в файле нет: там имена переменных (`*_password_env`), значения приходят из
+окружения и никогда не попадают в логи (значения печатаются как `<redacted:ИМЯ>`).
+
+```bash
+export CLICKHOUSE_ETL_WRITER_PASSWORD=...
+export CLICKHOUSE_GO_WRITER_PASSWORD=...
+etl ingest --config config/app.toml --source s3 --max-files 1
+```
+
+### Локальный стенд
+
+`local/docker-compose.yml` поднимает ClickHouse 26.9 и применяет по порядку:
+`01-users.sql` (SQL-пользователи `etl_writer`/`pipeline_writer`), `schema.sql`
+(монтируется из корня репозитория, а не копируется), `schema_loadtest.sql` и
+`04-grants.sql` с грантами из таблицы ТЗ 3.6. Пользователи создаются через SQL,
+а не в `users.xml`: гранты на пользователя из `users_xml` ClickHouse отклоняет
+(`ACCESS_STORAGE_READONLY`), проверено на 26.9.
+
+`max_sessions_for_user=1` на стенде **не выставляется**: на 26.9 настройка не
+ограничивает второй нативный TCP-сеанс ни в профиле, ни в блоке пользователя
+(проверено вручную), поэтому ограничение управляющего слота — задача
+инфраструктуры на VPS, а корректность перехода обеспечивает проверка
+`state_revision` в протоколе публикации.
+
+```bash
+docker compose -f local/docker-compose.yml up -d --wait
+export CLICKHOUSE_ETL_WRITER_PASSWORD=dev-etl-writer-password
+export CLICKHOUSE_GO_WRITER_PASSWORD=dev-go-writer-password
+etl ingest --config config/app.local.toml --source s3 --max-files 1
+```
+
+Пароли в `local/init/01-users.sql` — только для локальной базы. На VPS
+пользователей и гранты создаёт администратор. Пересоздать стенд с нуля:
+`docker compose -f local/docker-compose.yml down -v`.
+
+### Интеграционные тесты (живой ClickHouse)
+
+```bash
+docker compose -f local/docker-compose.yml up -d --wait
+go test -tags=integration -count=1 -v ./internal/sink -run TestIntegration
+```
+
+Тест применяет схему сам, проверяет: 100 работ + `dim_topics` дошли и читаются;
+`publication_date` = `YYYYMMDD`, `publication_date = 0` для неизвестной даты;
+`has_fwci`/`fwci`; массивы тем одинаковой длины и оценка `0` в своей позиции;
+`ReplacingMergeTree` отдаёт более новую версию; `DELETE FROM works` скрывает все
+версии `work_id`, не задевая соседнюю работу; `works_loadtest` отдельно от
+рабочей таблицы. Без поднятого ClickHouse тесты пропускаются, а не падают.
+Проверка `max_sessions_for_user` оставлена как канарейка для VPS: если сервер
+начнёт отклонять второй сеанс, тест станет утверждать вместо пропуска.
+
 
 ## API-ключ OpenAlex
 
@@ -129,7 +193,9 @@ go test -v -count=1 -tags=inspect ./internal/adapters/api -run TestDiagRealAPI
 | `internal/adapters/s3` | манифесты, `ReaderAt` поверх Range-запросов, префетч по футеру, чтение works/topics/institutions |
 | `internal/adapters/api` | OpenAlex REST: курсор, token bucket, ретраи 429/5xx, `POST /api-keys` |
 | `internal/normalizer` | projection-модель, фильтр IT, $O(N)$ абстракт, дедуп (roaring64) |
-| `internal/sink` | `BatchSink`, `NoopSink`, SoA-батчи и пулы |
+| `internal/sink` | `BatchSink`, `NoopSink`, `ClickHouseSink` (явные колонки, ack на батч), SoA-батчи и пулы |
+| `internal/config` | `config/app.toml`: секции `[clickhouse]`/`[go_etl]`, пароли только из окружения |
+| `internal/clickhouse` | два пула (`etl_writer`, одноконный `pipeline_writer`), классификация ошибок в `error_code` |
 | `internal/metrics` | атомарные счётчики, p50/p95/p99 латентности батчей |
 | `internal/ingest` | воркер-пул по файлам, шарды, чекпоинт, graceful shutdown |
 | `internal/jobs` | менеджер джоб и снапшоты для TUI |

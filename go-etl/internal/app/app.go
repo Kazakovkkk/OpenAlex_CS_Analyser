@@ -299,15 +299,21 @@ func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.Dimens
 	if err != nil {
 		return fmt.Errorf("app: sync topics: %w", err)
 	}
-	instRes, err := ingest.Run(ctx, plan.Institutions, &ingest.S3InstitutionsProcessor{
-		Client: a.cfg.S3, Sink: a.cfg.Sink, Metrics: j.Metrics(), ReadOptions: readOpts,
-	}, opts)
-	if err != nil {
-		return fmt.Errorf("app: sync institutions: %w", err)
+	var instRows, instBytes uint64
+	if _, isClickHouse := a.cfg.Sink.(*sink.ClickHouseSink); isClickHouse {
+		a.logger.Info("sync-dims: institutions skipped: no dim_institutions in the MVP schema")
+	} else {
+		instRes, err := ingest.Run(ctx, plan.Institutions, &ingest.S3InstitutionsProcessor{
+			Client: a.cfg.S3, Sink: a.cfg.Sink, Metrics: j.Metrics(), ReadOptions: readOpts,
+		}, opts)
+		if err != nil {
+			return fmt.Errorf("app: sync institutions: %w", err)
+		}
+		instRows, instBytes = instRes.Written, instRes.BytesRead
 	}
 	a.logger.Info("sync-dims: finished", "job", j.ID(),
-		"topics_rows", topicsRes.Written, "institutions_rows", instRes.Written,
-		"bytes_read", topicsRes.BytesRead+instRes.BytesRead)
+		"topics_rows", topicsRes.Written, "institutions_rows", instRows,
+		"bytes_read", topicsRes.BytesRead+instBytes)
 	return nil
 }
 

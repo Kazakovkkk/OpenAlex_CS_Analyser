@@ -1,0 +1,32 @@
+# Пример дистрибутивного конфига (config/app.toml).
+#
+# Владелец файла — Python-разработчик: он собирает дистрибутив и раскладывает
+# config/app.toml. Go читает только [clickhouse] и [go_etl]; секции [compose] и
+# [actions] принадлежат Python и игнорируются, как и любые будущие ключи.
+#
+# Паролей в файле нет: здесь только имена переменных окружения.
+
+[compose]
+start_clickhouse = true
+start_go_etl = true
+
+[actions]
+download_data = true
+refresh_analysis = true
+offer_shutdown_on_exit = true
+
+[clickhouse]
+host = "clickhouse"
+port = 9000
+database = "openalex"
+secure = false
+reader_user = "report_reader"
+reader_password_env = "CLICKHOUSE_REPORT_READER_PASSWORD"
+pipeline_writer_user = "pipeline_writer"
+python_pipeline_writer_password_env = "CLICKHOUSE_PYTHON_WRITER_PASSWORD"
+
+[go_etl]
+base_url = "http://go-etl:8081"
+etl_writer_user = "etl_writer"
+etl_writer_password_env = "CLICKHOUSE_ETL_WRITER_PASSWORD"
+go_pipeline_writer_password_env = "CLICKHOUSE_GO_WRITER_PASSWORD"

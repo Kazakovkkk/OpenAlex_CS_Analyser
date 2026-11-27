@@ -11,9 +11,14 @@ bin/
 *.jsonl
 *.jsonl.gz
 tmp/
+.gocache/
+.gotmp/
+.gopath/
+.gomodcache/
 .env
 .env.local
 .DS_Store
 .idea/
 .vscode/
 *.txt
+docs/

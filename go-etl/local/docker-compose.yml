@@ -1,0 +1,30 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9
+    container_name: go-etl-clickhouse
+    ports:
+      - "127.0.0.1:9000:9000" # native TCP (what the Go driver uses)
+      - "127.0.0.1:8123:8123" # HTTP (curl / clickhouse-client --http)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - ./conf/users.d:/etc/clickhouse-server/users.d:ro
+      - ./init/01-users.sql:/docker-entrypoint-initdb.d/01-users.sql:ro
+      - ../schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
+      - ../schema_loadtest.sql:/docker-entrypoint-initdb.d/03-loadtest.sql:ro
+      - ./init/04-grants.sql:/docker-entrypoint-initdb.d/04-grants.sql:ro
+      - ch-data:/var/lib/clickhouse
+      - ch-logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+volumes:
+  ch-data:
+  ch-logs:
