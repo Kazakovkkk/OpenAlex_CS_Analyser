@@ -1,4 +1,4 @@
-﻿package ingest
+package ingest
 
 import (
 	"fmt"
@@ -53,13 +53,16 @@ func bySizeAsc(a, b Entry) int {
 
 func bySizeDesc(a, b Entry) int { return -bySizeAsc(a, b) }
 
-// FilterByPartitionDate keeps only the files whose `updated_date=YYYY-MM-DD`
-// partition is not older than from. The S3 snapshot is partitioned by update
-// date, so this is the S3 equivalent of the API's from_date and makes
-// "load only recent changes" possible without downloading the whole snapshot.
-//
-// An empty from keeps everything; entries without a parsable partition are kept
-// (fail open: an unknown layout must not silently drop data).
+var updateCatchUpCutoff = time.Date(2026, 11, 7, 0, 0, 0, 0, time.UTC)
+
+func UpdateFrom(published time.Time) time.Time {
+	p := published.UTC().Truncate(24 * time.Hour)
+	if p.Before(updateCatchUpCutoff) {
+		return p
+	}
+	return p.AddDate(0, 0, 1)
+}
+
 func FilterByPartitionDate(entries []Entry, from string) ([]Entry, error) {
 	if from == "" {
 		return entries, nil

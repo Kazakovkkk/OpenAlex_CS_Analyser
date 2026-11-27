@@ -1,4 +1,4 @@
-﻿package httpapi
+package httpapi
 
 import (
 	"context"
@@ -9,7 +9,30 @@ import (
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", InstanceID: s.instanceID})
+}
+
+// handleIngestRestart clears the corpus and reloads it, but only with a valid
+// one-shot token issued when the release changed (spec §4.4).
+func (s *Server) handleIngestRestart(w http.ResponseWriter, r *http.Request) {
+	if !s.requireBackend(w) {
+		return
+	}
+	var req RestartRequest
+	if !s.decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.RestartToken) == "" {
+		writeErrorCode(w, http.StatusBadRequest, "restart_offer_expired", "restart_token is required")
+		return
+	}
+	if j := s.manager.RunningOfKind(jobs.KindIngest); j != nil {
+		s.accepted(w, j)
+		return
+	}
+	s.startJob(w, jobs.KindIngest, func(ctx context.Context, j *jobs.Job) error {
+		return s.backend.RestartIngest(ctx, j, req)
+	})
 }
 
 func (s *Server) handleDimensionsSync(w http.ResponseWriter, r *http.Request) {
@@ -18,6 +41,10 @@ func (s *Server) handleDimensionsSync(w http.ResponseWriter, r *http.Request) {
 	}
 	var req DimensionsRequest
 	if !s.decode(w, r, &req) {
+		return
+	}
+	if j := s.manager.RunningOfKind(jobs.KindDimensions); j != nil {
+		s.accepted(w, j)
 		return
 	}
 	s.startJob(w, jobs.KindDimensions, func(ctx context.Context, j *jobs.Job) error {
@@ -35,6 +62,10 @@ func (s *Server) handleIngestStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := req.normalize(); err != nil {
 		writeError(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+	if j := s.manager.RunningOfKind(jobs.KindIngest); j != nil {
+		s.accepted(w, j)
 		return
 	}
 	s.startJob(w, jobs.KindIngest, func(ctx context.Context, j *jobs.Job) error {

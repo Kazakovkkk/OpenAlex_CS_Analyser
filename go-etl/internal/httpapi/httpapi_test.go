@@ -25,10 +25,12 @@ type fakeBackend struct {
 	loadtest   LoadtestRequest
 	emails     []string
 
-	block     bool
-	ingestErr error
-	keyResult api.APIKeyResult
-	keyErr    error
+	block      bool
+	ingestErr  error
+	keyResult  api.APIKeyResult
+	keyErr     error
+	restart    RestartRequest
+	restartErr error
 }
 
 func (f *fakeBackend) RunIngest(ctx context.Context, j *jobs.Job, req IngestRequest) error {
@@ -52,14 +54,24 @@ func (f *fakeBackend) RunIngest(ctx context.Context, j *jobs.Job, req IngestRequ
 func (f *fakeBackend) RunDimensions(ctx context.Context, j *jobs.Job, req DimensionsRequest) error {
 	f.mu.Lock()
 	f.dimensions = req
+	block := f.block
 	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return nil
 }
 
 func (f *fakeBackend) RunLoadtest(ctx context.Context, j *jobs.Job, req LoadtestRequest) error {
 	f.mu.Lock()
 	f.loadtest = req
+	block := f.block
 	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return nil
 }
 
@@ -317,15 +329,58 @@ func TestJobsLimitResponse(t *testing.T) {
 
 	be := &fakeBackend{block: true}
 	srv, _ := newTestServer(t, be)
-	for i := range jobs.MaxRunningJobs {
-		rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{}`)
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("start %d status = %d", i, rec.Code)
+	paths := []string{
+		"/api/v1/ingest/start",
+		"/api/v1/dimensions/sync",
+		"/api/v1/loadtest/start",
+		"/api/v1/loadtest/start",
+	}
+	for i, p := range paths {
+		if rec := doRequest(t, srv, http.MethodPost, p, `{}`); rec.Code != http.StatusAccepted {
+			t.Fatalf("start %d (%s) status = %d, body=%s", i, p, rec.Code, rec.Body)
 		}
 	}
-	rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{}`)
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/loadtest/start", `{}`)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429, body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestIngestStartIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	be := &fakeBackend{block: true}
+	srv, mgr := newTestServer(t, be)
+
+	var first, second struct {
+		JobID      string `json:"job_id"`
+		InstanceID string `json:"instance_id"`
+		State      string `json:"state"`
+	}
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("first start status = %d", rec.Code)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	rec = doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{"workers":2}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("second start status = %d, body=%s", rec.Code, rec.Body)
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+
+	if first.JobID == "" || first.JobID != second.JobID {
+		t.Fatalf("job ids differ: %q vs %q", first.JobID, second.JobID)
+	}
+	if first.State != "running" || second.State != "running" {
+		t.Fatalf("states = %q / %q, want running", first.State, second.State)
+	}
+	if got := mgr.Running(); got != 1 {
+		t.Fatalf("running jobs = %d, want exactly 1", got)
 	}
 }
 
@@ -383,4 +438,43 @@ func waitState(t *testing.T, m *jobs.Manager, id string, want jobs.State) {
 	}
 	snap, _ := m.Snapshot(id)
 	t.Fatalf("job %s state = %s, want %s", id, snap.State, want)
+}
+
+func (f *fakeBackend) RestartIngest(ctx context.Context, j *jobs.Job, req RestartRequest) error {
+	f.mu.Lock()
+	f.restart = req
+	err := f.restartErr
+	block := f.block
+	f.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func TestIngestRestartRequiresToken(t *testing.T) {
+	t.Parallel()
+
+	be := &fakeBackend{}
+	srv, mgr := newTestServer(t, be)
+
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/restart", `{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "restart_offer_expired") {
+		t.Fatalf("body = %s, want error_code restart_offer_expired", rec.Body)
+	}
+	if mgr.Running() != 0 {
+		t.Fatalf("running jobs = %d, want 0", mgr.Running())
+	}
+
+	rec = doRequest(t, srv, http.MethodPost, "/api/v1/ingest/restart", `{"restart_token":"tok-1"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("with token status = %d, want 202, body=%s", rec.Code, rec.Body)
+	}
 }

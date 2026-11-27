@@ -90,11 +90,10 @@ func IsCSJSONWork(w *JSONWork) bool {
 }
 
 func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkOutcome {
-	if !IsCSParquetWork(w) {
+	workID := ParseWorkID(derefString(w.ID))
+	if !IsCSParquetWork(w) && !n.isKnown(workID) {
 		return OutcomeFilteredOut
 	}
-
-	workID := ParseWorkID(derefString(w.ID))
 	if n.dedup != nil && !n.dedup.AddIfNew(workID) {
 		return OutcomeDuplicate
 	}
@@ -187,11 +186,10 @@ func (n *Normalizer) IngestRawJSON(raw []byte, b *sink.WorksBatch) (WorkOutcome,
 }
 
 func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome {
-	if !IsCSJSONWork(w) {
+	workID := ParseWorkID(w.ID)
+	if !IsCSJSONWork(w) && !n.isKnown(workID) {
 		return OutcomeFilteredOut
 	}
-
-	workID := ParseWorkID(w.ID)
 	if n.dedup != nil && !n.dedup.AddIfNew(workID) {
 		return OutcomeDuplicate
 	}

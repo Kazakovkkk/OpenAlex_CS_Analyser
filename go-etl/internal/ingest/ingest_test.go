@@ -40,6 +40,7 @@ type fakeProcessor struct {
 	startOnce       sync.Once
 	delay           time.Duration
 	rows            uint64
+	truncated       bool
 }
 
 func newFakeProcessor() *fakeProcessor {
@@ -80,6 +81,7 @@ func (f *fakeProcessor) Process(ctx context.Context, e Entry, limit int64) (File
 		MatchedRows:       10,
 		WrittenRows:       written,
 		DedupDropped:      1,
+		Truncated:         f.truncated,
 		BytesRead:         uint64(e.Meta.ContentLength),
 		HTTPRequests:      1,
 		PrefetchPlanBytes: 42,
@@ -243,6 +245,37 @@ func TestRunStopsGracefullyOnCancel(t *testing.T) {
 	}
 	if len(done_) != 0 {
 		t.Fatalf("checkpoint must be empty, got %d entries", len(done_))
+	}
+}
+
+func TestRunDoesNotCheckpointTruncatedFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	ckPath := filepath.Join(dir, "checkpoint.jsonl")
+
+	p := newFakeProcessor()
+	p.rows = 3
+	p.truncated = true
+
+	opts := quietOptions()
+	opts.Workers = 1
+	opts.AttemptsPerFile = 1
+	opts.CheckpointPath = ckPath
+
+	res, err := Run(context.Background(), fakeEntries(2), p, opts)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.FilesDone != 2 {
+		t.Fatalf("done = %d, want 2 (truncated files still count as processed)", res.FilesDone)
+	}
+	done, err := LoadDone(ckPath)
+	if err != nil {
+		t.Fatalf("LoadDone: %v", err)
+	}
+	if len(done) != 0 {
+		t.Fatalf("a file truncated by max_records must not be checkpointed, got %v", done)
 	}
 }
 

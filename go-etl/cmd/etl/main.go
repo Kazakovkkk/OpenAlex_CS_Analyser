@@ -125,23 +125,27 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
-	defer closeSink()
+	defer st.Close()
 
 	backend := app.New(app.Config{
 		S3:            s3Client,
 		API:           api.NewClient(api.Options{APIKey: app.ResolveAPIKey("")}),
-		Sink:          snk,
+		Sink:          st.sink,
+		Pipeline:      st.pipeline,
+		Checkpoints:   st.checkpoints,
+		BuildKnownIDs: st.buildKnownIDs,
+		DeleteWorks:   st.deleteWorks,
 		APIKey:        app.ResolveAPIKey(""),
 		CheckpointDir: *ckDir,
 		SamplePath:    *sample,
 	}, logger)
 
 	manager := jobs.NewManager()
-	srv := httpapi.New(manager, backend)
+	srv := httpapi.New(manager, backend, httpapi.WithInstanceID(backend.InstanceID()))
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
@@ -234,17 +238,21 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
-	defer closeSink()
+	defer st.Close()
 
 	resolvedKey := app.ResolveAPIKey(*apiKey)
 	backend := app.New(app.Config{
 		S3:               s3Client,
 		API:              api.NewClient(api.Options{APIKey: resolvedKey}),
-		Sink:             snk,
+		Sink:             st.sink,
+		Pipeline:         st.pipeline,
+		Checkpoints:      st.checkpoints,
+		BuildKnownIDs:    st.buildKnownIDs,
+		DeleteWorks:      st.deleteWorks,
 		APIKey:           resolvedKey,
 		CheckpointDir:    *ckDir,
 		FullGetThreshold: int64(*fullGetMB) << 20,
@@ -280,13 +288,13 @@ func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error 
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	snk, closeSink, err := openSink(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
-	defer closeSink()
+	defer st.Close()
 
-	backend := app.New(app.Config{S3: s3Client, Sink: snk}, logger)
+	backend := app.New(app.Config{S3: s3Client, Sink: st.sink, Pipeline: st.pipeline, Checkpoints: st.checkpoints}, logger)
 	manager := jobs.NewManager()
 	return runOneJob(ctx, logger, manager, jobs.KindDimensions, func(ctx context.Context, j *jobs.Job) error {
 		return backend.RunDimensions(ctx, j, httpapi.DimensionsRequest{ForceReload: *force})

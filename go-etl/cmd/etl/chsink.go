@@ -9,57 +9,120 @@ import (
 
 	"go-etl/internal/clickhouse"
 	"go-etl/internal/config"
+	"go-etl/internal/knownids"
+	"go-etl/internal/pipeline"
 	"go-etl/internal/sink"
 )
 
-// openSink builds the write path for one process.
+// stores is everything a process needs from ClickHouse: the write path plus the
+// publication protocol. All of it is nil/Noop when no --config was given.
+type stores struct {
+	sink          sink.BatchSink
+	pipeline      *pipeline.Store
+	checkpoints   *pipeline.CheckpointStore
+	buildKnownIDs func(ctx context.Context) (*knownids.Index, time.Duration, error)
+	deleteWorks   func(ctx context.Context, ids []uint64) (int64, error)
+	closeFn       func()
+}
+
+func (s *stores) Close() {
+	if s.closeFn != nil {
+		s.closeFn()
+	}
+}
+
+// openStores builds the ClickHouse side of the process.
 //
-// No --config means diagnostic mode: NoopSink, everything else unchanged. That
-// keeps the pre-ClickHouse workflows (S3 diagnostics, benchmarks, load tests on
-// the ring) working without a database.
+// No --config means diagnostic mode: NoopSink, no protocol, everything else
+// unchanged, so the pre-ClickHouse workflows keep working.
 //
-// With --config the process opens the etl_writer pool and inserts every batch
-// synchronously. The pool is closed by the returned function, which the caller
-// must defer.
-func openSink(ctx context.Context, path string, logger *slog.Logger) (sink.BatchSink, func(), error) {
+// With --config two pools are opened: etl_writer for data and checkpoints, and
+// pipeline_writer for the state machine (that user owns the TRUNCATE used when a
+// new load starts).
+func openStores(ctx context.Context, path string, logger *slog.Logger) (*stores, error) {
 	cfg, err := config.Load(path)
 	if errors.Is(err, config.ErrNoPath) {
 		logger.Info("clickhouse: disabled, using diagnostic NoopSink")
-		return sink.NewNoopSink(), func() {}, nil
+		return &stores{sink: sink.NewNoopSink(), closeFn: func() {}}, nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	user, password, err := cfg.ETLWriterCredentials()
+	dataUser, dataPass, err := cfg.ETLWriterCredentials()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	pipeUser, pipePass, err := cfg.PipelineWriterCredentials()
+	if err != nil {
+		return nil, err
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	conn, err := clickhouse.Open(dialCtx, clickhouse.RoleETLWriter, clickhouse.Options{
+	dataConn, err := clickhouse.Open(dialCtx, clickhouse.RoleETLWriter, clickhouse.Options{
 		Addr:     cfg.Addr(),
 		Database: cfg.ClickHouse.Database,
-		User:     user,
-		Password: password.Value(),
+		User:     dataUser,
+		Password: dataPass.Value(),
 		Secure:   cfg.ClickHouse.Secure,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("clickhouse: connect %s: %w", cfg.Redacted(), err)
+		return nil, fmt.Errorf("clickhouse: connect %s: %w", cfg.Redacted(), err)
 	}
 
-	snk, err := sink.NewClickHouseSink(conn, cfg.ClickHouse.Database)
+	pipeConn, err := clickhouse.Open(dialCtx, clickhouse.RolePipelineWriter, clickhouse.Options{
+		Addr:     cfg.Addr(),
+		Database: cfg.ClickHouse.Database,
+		User:     pipeUser,
+		Password: pipePass.Value(),
+		Secure:   cfg.ClickHouse.Secure,
+	})
 	if err != nil {
-		_ = conn.Close()
-		return nil, nil, err
+		_ = dataConn.Close()
+		return nil, fmt.Errorf("clickhouse: connect pipeline writer %s: %w", cfg.Redacted(), err)
 	}
-	logger.Info("clickhouse: sink enabled", "target", cfg.Redacted(), "user", user)
 
-	return snk, func() {
-		if cerr := conn.Close(); cerr != nil {
-			logger.Warn("clickhouse: close", "err", cerr)
-		}
+	snk, err := sink.NewClickHouseSink(dataConn, cfg.ClickHouse.Database)
+	if err != nil {
+		_ = dataConn.Close()
+		_ = pipeConn.Close()
+		return nil, err
+	}
+	store, err := pipeline.NewStore(pipeConn, cfg.ClickHouse.Database)
+	if err != nil {
+		_ = dataConn.Close()
+		_ = pipeConn.Close()
+		return nil, err
+	}
+	ckpt, err := pipeline.NewCheckpointStore(dataConn, cfg.ClickHouse.Database)
+	if err != nil {
+		_ = dataConn.Close()
+		_ = pipeConn.Close()
+		return nil, err
+	}
+
+	logger.Info("clickhouse: ready", "target", cfg.Redacted(),
+		"data_user", dataUser, "pipeline_user", pipeUser)
+
+	return &stores{
+		sink:        snk,
+		pipeline:    store,
+		checkpoints: ckpt,
+		deleteWorks: func(ctx context.Context, ids []uint64) (int64, error) {
+			return pipeline.DeleteWorks(ctx, dataConn, cfg.ClickHouse.Database, ids)
+		},
+		buildKnownIDs: func(ctx context.Context) (*knownids.Index, time.Duration, error) {
+			return knownids.Build(ctx, dataConn, cfg.ClickHouse.Database, "works")
+		},
+		closeFn: func() {
+			if cerr := dataConn.Close(); cerr != nil {
+				logger.Warn("clickhouse: close data pool", "err", cerr)
+			}
+			if cerr := pipeConn.Close(); cerr != nil {
+				logger.Warn("clickhouse: close pipeline pool", "err", cerr)
+			}
+		},
 	}, nil
 }

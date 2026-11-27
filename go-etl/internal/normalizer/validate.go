@@ -182,6 +182,12 @@ func (n *Normalizer) resolveJSONYear(w *JSONWork) (int, RejectReason) {
 	return year, ""
 }
 
+// isKnown reports whether the work is already stored in ClickHouse; such a work
+// is written even when it left the corpus, so analytics stops counting it.
+func (n *Normalizer) isKnown(workID uint64) bool {
+	return n.knownWork != nil && workID != 0 && n.knownWork(workID)
+}
+
 func (n *Normalizer) yearInRange(year int) bool {
 	if year < 1 {
 		return false

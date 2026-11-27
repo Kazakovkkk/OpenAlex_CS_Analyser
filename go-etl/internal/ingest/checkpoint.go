@@ -69,6 +69,25 @@ func (c *Checkpoint) Close() error {
 	return err
 }
 
+type Ledger interface {
+	LoadDone() (map[string]struct{}, error)
+	MarkDone(objectKey string) error
+}
+
+type fileLedger struct{ ck *Checkpoint }
+
+func newFileLedger(path string) (*fileLedger, error) {
+	ck, err := OpenCheckpoint(path)
+	if err != nil {
+		return nil, err
+	}
+	return &fileLedger{ck: ck}, nil
+}
+
+func (f *fileLedger) LoadDone() (map[string]struct{}, error) { return LoadDone(f.ck.Path()) }
+func (f *fileLedger) MarkDone(objectKey string) error        { return f.ck.MarkDone(objectKey) }
+func (f *fileLedger) Close() error                           { return f.ck.Close() }
+
 func LoadDone(path string) (map[string]struct{}, error) {
 	f, err := os.Open(path)
 	if err != nil {

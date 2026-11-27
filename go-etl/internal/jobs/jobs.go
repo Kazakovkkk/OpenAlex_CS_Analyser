@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go-etl/internal/metrics"
+	"go-etl/internal/pipeline"
 )
 
 type State string
@@ -63,8 +64,10 @@ type Snapshot struct {
 	P95BatchMs float64 `json:"p95_batch_ms"`
 	P99BatchMs float64 `json:"p99_batch_ms"`
 
-	CurrentItem string `json:"current_item"`
-	Error       string `json:"error"`
+	CurrentItem  string `json:"current_item"`
+	Error        string `json:"error"`
+	ErrorCode    string `json:"error_code,omitempty"`
+	RestartToken string `json:"restart_token,omitempty"`
 }
 
 type Runner func(ctx context.Context, j *Job) error
@@ -82,6 +85,7 @@ type Job struct {
 	mu         sync.Mutex
 	state      State
 	err        error
+	errCode    string
 	startedAt  time.Time
 	finishedAt time.Time
 }
@@ -137,6 +141,12 @@ func (j *Job) Snapshot() Snapshot {
 	if j.err != nil {
 		errText = j.err.Error()
 	}
+	errCode := j.errCode
+	var restartToken string
+	var changed *pipeline.SnapshotChangedError
+	if errors.As(j.err, &changed) {
+		restartToken = changed.Token
+	}
 	started := j.startedAt
 	finished := j.finishedAt
 	j.mu.Unlock()
@@ -168,6 +178,8 @@ func (j *Job) Snapshot() Snapshot {
 		P99BatchMs:       m.P99BatchMs,
 		CurrentItem:      m.CurrentItem,
 		Error:            errText,
+		ErrorCode:        errCode,
+		RestartToken:     restartToken,
 	}
 }
 
@@ -231,6 +243,7 @@ func (m *Manager) Start(parent context.Context, kind Kind, run Runner) (*Job, er
 		case err != nil && !errors.Is(err, context.Canceled):
 			j.state = StateFailed
 			j.err = err
+			j.errCode = ErrorCode(err)
 		case ctx.Err() != nil:
 			j.state = StateStopped
 		default:
@@ -256,6 +269,17 @@ func (m *Manager) Get(id string) (*Job, bool) {
 	defer m.mu.Unlock()
 	j, ok := m.jobs[id]
 	return j, ok
+}
+
+func (m *Manager) RunningOfKind(kind Kind) *Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j.kind == kind && j.State() == StateRunning {
+			return j
+		}
+	}
+	return nil
 }
 
 func (m *Manager) Snapshot(id string) (Snapshot, bool) {

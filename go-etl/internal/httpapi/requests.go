@@ -1,4 +1,4 @@
-﻿package httpapi
+package httpapi
 
 import (
 	"fmt"
@@ -11,6 +11,11 @@ import (
 type (
 	DimensionsRequest struct {
 		ForceReload bool `json:"force_reload"`
+	}
+
+	// RestartRequest confirms a restart after the release changed mid-load.
+	RestartRequest struct {
+		RestartToken string `json:"restart_token"`
 	}
 
 	IngestRequest struct {
@@ -44,11 +49,8 @@ const (
 	SourceS3  = "s3"
 	SourceAPI = "api"
 
-	DateFilterUpdated = "updated"
-	DateFilterCreated = "created"
-	// DateFilterPublication is an additive extension of the spec contract: the free
-	// OpenAlex tier refuses from_updated_date/from_created_date (403 Plan upgrade
-	// required), so the API source can filter by publication date instead.
+	DateFilterUpdated     = "updated"
+	DateFilterCreated     = "created"
 	DateFilterPublication = "publication"
 )
 
@@ -141,12 +143,14 @@ func (r *LoadtestRequest) normalize() error {
 // Responses.
 type (
 	healthResponse struct {
-		Status string `json:"status"`
+		Status     string `json:"status"`
+		InstanceID string `json:"instance_id"`
 	}
 
 	jobAccepted struct {
-		JobID string     `json:"job_id"`
-		State jobs.State `json:"state"`
+		JobID      string     `json:"job_id"`
+		InstanceID string     `json:"instance_id"`
+		State      jobs.State `json:"state"`
 	}
 
 	stopResponse struct {

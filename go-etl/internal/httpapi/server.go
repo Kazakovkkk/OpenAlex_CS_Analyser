@@ -1,4 +1,4 @@
-﻿package httpapi
+package httpapi
 
 import (
 	"context"
@@ -16,17 +16,19 @@ import (
 const (
 	DefaultMaxBodyBytes = 1 << 20
 
-	pathHealth      = "/health"
-	pathDimsSync    = "/api/v1/dimensions/sync"
-	pathIngestStart = "/api/v1/ingest/start"
-	pathLoadtest    = "/api/v1/loadtest/start"
-	pathRequestKey  = "/api/v1/openalex/request-key"
-	pathJob         = "/api/v1/jobs/{job_id}"
-	pathJobStop     = "/api/v1/jobs/{job_id}/stop"
+	pathHealth        = "/health"
+	pathDimsSync      = "/api/v1/dimensions/sync"
+	pathIngestStart   = "/api/v1/ingest/start"
+	pathIngestRestart = "/api/v1/ingest/restart"
+	pathLoadtest      = "/api/v1/loadtest/start"
+	pathRequestKey    = "/api/v1/openalex/request-key"
+	pathJob           = "/api/v1/jobs/{job_id}"
+	pathJobStop       = "/api/v1/jobs/{job_id}/stop"
 )
 
 type Backend interface {
 	RunIngest(ctx context.Context, j *jobs.Job, req IngestRequest) error
+	RestartIngest(ctx context.Context, j *jobs.Job, req RestartRequest) error
 	RunDimensions(ctx context.Context, j *jobs.Job, req DimensionsRequest) error
 	RunLoadtest(ctx context.Context, j *jobs.Job, req LoadtestRequest) error
 	RequestAPIKey(ctx context.Context, email string) (api.APIKeyResult, error)
@@ -42,6 +44,14 @@ func WithMaxBodyBytes(n int64) Option {
 	}
 }
 
+func WithInstanceID(id string) Option {
+	return func(s *Server) {
+		if id != "" {
+			s.instanceID = id
+		}
+	}
+}
+
 func WithBaseContext(ctx context.Context) Option {
 	return func(s *Server) {
 		if ctx != nil {
@@ -51,11 +61,12 @@ func WithBaseContext(ctx context.Context) Option {
 }
 
 type Server struct {
-	manager *jobs.Manager
-	backend Backend
-	maxBody int64
-	baseCtx context.Context
-	mux     *http.ServeMux
+	manager    *jobs.Manager
+	backend    Backend
+	maxBody    int64
+	baseCtx    context.Context
+	instanceID string
+	mux        *http.ServeMux
 }
 
 func New(manager *jobs.Manager, backend Backend, opts ...Option) *Server {
@@ -77,6 +88,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+pathHealth, s.handleHealth)
 	s.mux.HandleFunc("POST "+pathDimsSync, s.handleDimensionsSync)
 	s.mux.HandleFunc("POST "+pathIngestStart, s.handleIngestStart)
+	s.mux.HandleFunc("POST "+pathIngestRestart, s.handleIngestRestart)
 	s.mux.HandleFunc("POST "+pathLoadtest, s.handleLoadtestStart)
 	s.mux.HandleFunc("GET "+pathJob, s.handleJob)
 	s.mux.HandleFunc("POST "+pathJobStop, s.handleJobStop)
@@ -88,7 +100,8 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 type errorResponse struct {
-	Error string `json:"error"`
+	Error     string `json:"error"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -104,6 +117,10 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, format string, args ...any) {
 	writeJSON(w, status, errorResponse{Error: fmt.Sprintf(format, args...)})
+}
+
+func writeErrorCode(w http.ResponseWriter, status int, code, format string, args ...any) {
+	writeJSON(w, status, errorResponse{Error: fmt.Sprintf(format, args...), ErrorCode: code})
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -142,5 +159,10 @@ func (s *Server) startJob(w http.ResponseWriter, kind jobs.Kind, run jobs.Runner
 		writeError(w, status, "%v", err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, jobAccepted{JobID: j.ID(), State: jobs.StateRunning})
+	s.accepted(w, j)
+}
+
+// accepted answers with an already-running job (idempotent start).
+func (s *Server) accepted(w http.ResponseWriter, j *jobs.Job) {
+	writeJSON(w, http.StatusAccepted, jobAccepted{JobID: j.ID(), InstanceID: s.instanceID, State: jobs.StateRunning})
 }

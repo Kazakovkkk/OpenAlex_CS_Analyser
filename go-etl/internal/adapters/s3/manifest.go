@@ -2,6 +2,8 @@ package s3
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -51,6 +53,46 @@ type SizeStats struct {
 
 func ParquetManifestKey(entity string) string {
 	return path.Join(ParquetPrefix, entity, "manifest.json")
+}
+
+// CanonicalID is the reproducible identity of one manifest: its date, format,
+// entity, record count and the sorted (url, content_length) pairs. Sorting is
+// applied to a copy, so the shard assignment (which follows the manifest order)
+// is never affected (round-2 answer 3.10).
+func (m *Manifest) CanonicalID() string {
+	if m == nil {
+		return ""
+	}
+	files := make([]ManifestEntry, len(m.Files))
+	copy(files, m.Files)
+	slices.SortFunc(files, func(a, b ManifestEntry) int {
+		return strings.Compare(a.URL, b.URL)
+	})
+
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s|%s|%d\n", m.Date, m.Format, m.Entity, m.RecordCount)
+	for _, f := range files {
+		fmt.Fprintf(h, "%s|%d\n", f.URL, f.Meta.ContentLength)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CombineIDs folds several manifest ids (for example works + topics) into the
+// single id stored in pipeline_state.
+func CombineIDs(parts ...string) string {
+	cleaned := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			cleaned = append(cleaned, p)
+		}
+	}
+	slices.Sort(cleaned)
+	h := sha256.New()
+	for _, p := range cleaned {
+		h.Write([]byte(p))
+		h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (c *Client) FetchManifest(ctx context.Context, key string) (*Manifest, error) {

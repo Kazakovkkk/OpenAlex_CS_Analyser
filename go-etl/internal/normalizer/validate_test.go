@@ -228,3 +228,32 @@ func TestTopicDedupAndScoreNormalisation(t *testing.T) {
 		t.Fatal("topic arrays must stay equal in length")
 	}
 }
+
+func TestKnownWorkLeavingCorpusIsWritten(t *testing.T) {
+	t.Parallel()
+	known := map[uint64]struct{}{1001: {}}
+	n := NewNormalizer(nil, WithSnapshotYear(2026), WithKnownWork(func(id uint64) bool {
+		_, ok := known[id]
+		return ok
+	}))
+
+	w := validWork()
+	w.PrimaryTopic = nil
+	if reason := n.PrepareParquet(w); reason != "" {
+		t.Fatalf("known work rejected: %q", reason)
+	}
+	b := sink.NewWorksBatch(1)
+	if got := n.AppendParquetWork(w, b); got != OutcomeAdded {
+		t.Fatalf("known work not written: %v", got)
+	}
+	if b.PrimaryFieldIDs[0] != 0 || len(b.TopicIDs[0]) != 0 {
+		t.Fatalf("supersede row = field %d, %d topics; want 0/0", b.PrimaryFieldIDs[0], len(b.TopicIDs[0]))
+	}
+
+	unknown := validWork()
+	unknown.ID = ptr("https://openalex.org/W9999")
+	unknown.PrimaryTopic = nil
+	if got := n.AppendParquetWork(unknown, sink.NewWorksBatch(1)); got != OutcomeFilteredOut {
+		t.Fatalf("unknown out-of-corpus work = %v, want filtered", got)
+	}
+}

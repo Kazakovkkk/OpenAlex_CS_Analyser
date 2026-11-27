@@ -1,4 +1,4 @@
-﻿package ingest
+package ingest
 
 import (
 	"context"
@@ -43,6 +43,7 @@ type Options struct {
 	AttemptsPerFile    int
 	Order              OrderMode
 	CheckpointPath     string
+	Checkpoints        Ledger
 	JobID              string
 	Metrics            *metrics.JobMetrics
 	FatalFailureStreak int
@@ -128,9 +129,23 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 		return res, nil
 	}
 
-	var ck *Checkpoint
-	if opts.CheckpointPath != "" {
-		done, err := LoadDone(opts.CheckpointPath)
+	var ledger Ledger
+	if opts.Checkpoints != nil {
+		ledger = opts.Checkpoints
+	} else if opts.CheckpointPath != "" {
+		fileLedger, err := newFileLedger(opts.CheckpointPath)
+		if err != nil {
+			return res, fmt.Errorf("ingest: open checkpoint: %w", err)
+		}
+		defer func() {
+			if cerr := fileLedger.Close(); cerr != nil {
+				logger.Warn("ingest: close checkpoint", "err", cerr)
+			}
+		}()
+		ledger = fileLedger
+	}
+	if ledger != nil {
+		done, err := ledger.LoadDone()
 		if err != nil {
 			return res, fmt.Errorf("ingest: load checkpoint: %w", err)
 		}
@@ -147,15 +162,6 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 			logger.Info("ingest: resuming from checkpoint",
 				"job", opts.JobID, "already_done", res.FilesSkipped, "remaining", len(ordered))
 		}
-		ck, err = OpenCheckpoint(opts.CheckpointPath)
-		if err != nil {
-			return res, fmt.Errorf("ingest: open checkpoint: %w", err)
-		}
-		defer func() {
-			if cerr := ck.Close(); cerr != nil {
-				logger.Warn("ingest: close checkpoint", "err", cerr)
-			}
-		}()
 	}
 	if len(ordered) == 0 {
 		return res, nil
@@ -240,8 +246,8 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 				fileRes, err := p.Process(runCtx, entry, limit)
 				if err == nil {
 					recordSuccess(entry, fileRes)
-					if ck != nil {
-						if cerr := ck.MarkDone(entry.URL); cerr != nil {
+					if ledger != nil && !fileRes.Truncated {
+						if cerr := ledger.MarkDone(entry.URL); cerr != nil {
 							logger.Warn("ingest: checkpoint write failed", "url", entry.URL, "err", cerr)
 						}
 					}

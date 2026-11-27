@@ -212,3 +212,32 @@ func TestNilRunner(t *testing.T) {
 		t.Fatal("expected an error for a nil runner")
 	}
 }
+
+func TestRunningOfKind(t *testing.T) {
+	t.Parallel()
+	m := NewManager()
+
+	started := make(chan struct{})
+	j, err := m.Start(context.Background(), KindIngest, func(ctx context.Context, _ *Job) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	<-started
+
+	if got := m.RunningOfKind(KindIngest); got == nil || got.ID() != j.ID() {
+		t.Fatalf("RunningOfKind(ingest) = %v, want %s", got, j.ID())
+	}
+	if got := m.RunningOfKind(KindDimensions); got != nil {
+		t.Fatalf("RunningOfKind(dimensions) = %s, want nil", got.ID())
+	}
+
+	m.Stop(j.ID())
+	<-j.Done()
+	if got := m.RunningOfKind(KindIngest); got != nil {
+		t.Fatalf("RunningOfKind after stop = %s, want nil", got.ID())
+	}
+}
