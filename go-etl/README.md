@@ -2,18 +2,14 @@
 
 Go-часть проекта: читает публичный Parquet-снимок OpenAlex (Works + Topics),
 нормализует записи, пишет их в ClickHouse и публикует версию набора в
-`pipeline_state`. Python-часть управляет загрузкой через HTTP и считает отчёт.
+`pipeline_state`.
 
-Контракт — `docs/go-etl-quality-review.md` (шаги 1–7). Старое ТЗ
-`docs/go-etl-mvp-spec.md` действует только там, где не противоречит новому.
 
 ## Сборка
 
 ```bash
 CGO_ENABLED=0 go build -o bin/etl ./cmd/etl
 ```
-
-Go 1.27+, локальные кеши можно задать через `GOPATH`, `GOCACHE`, `GOTMPDIR`.
 
 ## Конфигурация
 
