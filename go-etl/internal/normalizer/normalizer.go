@@ -65,6 +65,9 @@ func IsCSParquetWork(w *ParquetWork) bool {
 	if w == nil || (w.IsXPAC != nil && *w.IsXPAC) {
 		return false
 	}
+	if w.IsRetracted != nil && *w.IsRetracted {
+		return false
+	}
 	if !corpusTypeAllows(derefString(w.Type)) {
 		return false
 	}
@@ -79,6 +82,9 @@ func IsCSJSONWork(w *JSONWork) bool {
 	if w == nil || w.IsXPAC {
 		return false
 	}
+	if w.IsRetracted != nil && *w.IsRetracted {
+		return false
+	}
 	if !corpusTypeAllows(w.Type) {
 		return false
 	}
@@ -87,6 +93,30 @@ func IsCSJSONWork(w *JSONWork) bool {
 	}
 	fid := w.PrimaryTopic.Field.ID
 	return fid == csFieldID || strings.HasSuffix(fid, csFieldSuffix)
+}
+
+// IsKnown reports whether the work id is already stored. Known works are
+// written even when they leave the corpus, so FINAL selects the new version and
+// analytics stops counting them.
+func (n *Normalizer) IsKnown(workID uint64) bool {
+	return n != nil && n.isKnown(workID)
+}
+
+// WantsParquet reports whether the row must reach the normalizer: either it is
+// a new corpus candidate or a known work whose updated version must be stored.
+func (n *Normalizer) WantsParquet(w *ParquetWork) bool {
+	if w == nil {
+		return false
+	}
+	return n.IsKnown(ParseWorkID(derefString(w.ID))) || IsCSParquetWork(w)
+}
+
+// WantsJSON is the REST equivalent of WantsParquet.
+func (n *Normalizer) WantsJSON(w *JSONWork) bool {
+	if w == nil {
+		return false
+	}
+	return n.IsKnown(ParseWorkID(w.ID)) || IsCSJSONWork(w)
 }
 
 func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkOutcome {
@@ -126,6 +156,11 @@ func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkO
 			pFieldID = ParseFieldID(derefString(pt.Field.ID))
 		}
 	}
+	// A service version of a known work (is_xpac) is written with
+	// primary_field_id=0 so the FINAL-selected row drops out of the analysis.
+	if n.isKnown(workID) && derefBool(w.IsXPAC) {
+		pFieldID = 0
+	}
 
 	var pSourceID uint64
 	var pSourceType string
@@ -158,25 +193,22 @@ func (n *Normalizer) AppendParquetWork(w *ParquetWork, b *sink.WorksBatch) WorkO
 }
 
 func (n *Normalizer) AppendRawJSONWork(raw []byte, b *sink.WorksBatch) (WorkOutcome, error) {
-	if !FastJSONPreFilter(raw) {
-		return OutcomeFilteredOut, nil
-	}
 	var jw JSONWork
 	if err := sonic.Unmarshal(raw, &jw); err != nil {
 		return OutcomeFilteredOut, fmt.Errorf("sonic unmarshal work: %w", err)
+	}
+	if !n.WantsJSON(&jw) {
+		return OutcomeFilteredOut, nil
 	}
 	return n.AppendJSONWork(&jw, b), nil
 }
 
 func (n *Normalizer) IngestRawJSON(raw []byte, b *sink.WorksBatch) (WorkOutcome, RejectReason) {
-	if !FastJSONPreFilter(raw) {
-		return OutcomeFilteredOut, ""
-	}
 	var jw JSONWork
 	if err := sonic.Unmarshal(raw, &jw); err != nil {
 		return OutcomeRejected, RejectParseError
 	}
-	if !IsCSJSONWork(&jw) {
+	if !n.WantsJSON(&jw) {
 		return OutcomeFilteredOut, ""
 	}
 	if reason := n.PrepareJSON(&jw); reason != "" {
@@ -195,10 +227,10 @@ func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome
 	}
 
 	var pubDatePtr *time.Time
-	if t, ok := ParseDate32String(w.PublicationDate); ok {
+	if t, ok := ParseDate32String(derefString(w.PublicationDate)); ok {
 		pubDatePtr = b.AllocPubDate(t)
 	}
-	updatedDate := ParseTimestampString(w.UpdatedDate)
+	updatedDate := ParseTimestampString(derefString(w.UpdatedDate))
 
 	var fwciPtr *float32
 	if w.FWCI != nil && !math.IsNaN(*w.FWCI) && !math.IsInf(*w.FWCI, 0) {
@@ -213,6 +245,9 @@ func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome
 			pFieldID = ParseFieldID(pt.Field.ID)
 		}
 	}
+	if n.isKnown(workID) && w.IsXPAC {
+		pFieldID = 0
+	}
 
 	var pSourceID uint64
 	var pSourceType string
@@ -225,7 +260,7 @@ func (n *Normalizer) AppendJSONWork(w *JSONWork, b *sink.WorksBatch) WorkOutcome
 
 	b.WorkIDs = append(b.WorkIDs, workID)
 
-	b.PubYears = append(b.PubYears, ClampUint16(w.PublicationYear))
+	b.PubYears = append(b.PubYears, ClampUint16(derefInt32(w.PublicationYear)))
 	b.PubDates = append(b.PubDates, pubDatePtr)
 	b.UpdatedDates = append(b.UpdatedDates, updatedDate)
 
@@ -248,12 +283,23 @@ func AppendParquetTopic(t *ParquetTopic, b *sink.TopicsBatch) bool {
 	if t == nil {
 		return false
 	}
-	var sfID uint32
-	var sfName string
-	if t.Subfield != nil {
-		sfID = ParseSubfieldID(derefString(t.Subfield.ID))
-		sfName = derefString(t.Subfield.DisplayName)
+	topicID := ParseTopicID(derefString(t.ID))
+	if topicID == 0 {
+		return false
 	}
+	// The dictionary must carry a real hierarchy: a topic without a valid
+	// subfield/field is not usable by the report.
+	if t.Subfield == nil {
+		return false
+	}
+	sfID := ParseSubfieldID(derefString(t.Subfield.ID))
+	if sfID == 0 || strings.TrimSpace(derefString(t.Subfield.DisplayName)) == "" {
+		return false
+	}
+	if t.Field == nil || ParseFieldID(derefString(t.Field.ID)) == 0 {
+		return false
+	}
+	sfName := derefString(t.Subfield.DisplayName)
 	var fID uint16
 	var fName string
 	if t.Field != nil {
@@ -271,7 +317,7 @@ func AppendParquetTopic(t *ParquetTopic, b *sink.TopicsBatch) bool {
 		updatedDate = ParseParquetTimestampMicros(*t.UpdatedDate)
 	}
 
-	b.TopicIDs = append(b.TopicIDs, ParseTopicID(derefString(t.ID)))
+	b.TopicIDs = append(b.TopicIDs, topicID)
 	b.DisplayNames = append(b.DisplayNames, derefString(t.DisplayName))
 	b.Descriptions = append(b.Descriptions, derefString(t.Description))
 	b.SubfieldIDs = append(b.SubfieldIDs, sfID)

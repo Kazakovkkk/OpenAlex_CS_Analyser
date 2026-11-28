@@ -3,6 +3,7 @@ package clickhouse
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -72,6 +73,44 @@ func (o Options) withDefaults(role Role) Options {
 }
 
 func Open(ctx context.Context, role Role, o Options) (ch.Conn, error) {
+	opts, err := buildOptions(role, o)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := ch.Open(opts)
+	if err != nil {
+		return nil, Classify(err)
+	}
+
+	o = o.withDefaults(role)
+	pingCtx, cancel := context.WithTimeout(ctx, o.PingTimeout)
+	defer cancel()
+	if err := conn.Ping(pingCtx); err != nil {
+		_ = conn.Close()
+		return nil, Classify(err)
+	}
+	return conn, nil
+}
+
+// OpenSQL returns a database/sql handle, which is what the management user
+// needs: a transition must run on one pinned physical connection, so the caller
+// takes db.Conn(ctx) for the whole transition instead of using a pool that may
+// open a second session between statements.
+//
+// It deliberately does not ping: an idle Serve process must leave the
+// management slot free for Python (spec step 1).
+func OpenSQL(role Role, o Options) (*sql.DB, error) {
+	opts, err := buildOptions(role, o)
+	if err != nil {
+		return nil, err
+	}
+	db := ch.OpenDB(opts)
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
+}
+
+func buildOptions(role Role, o Options) (*ch.Options, error) {
 	o = o.withDefaults(role)
 	if strings.TrimSpace(o.Addr) == "" {
 		return nil, errors.New("clickhouse: empty address")
@@ -107,19 +146,7 @@ func Open(ctx context.Context, role Role, o Options) (ch.Conn, error) {
 	if role == RolePipelineWriter {
 		opts.Settings = ch.Settings{"max_execution_time": 0}
 	}
-
-	conn, err := ch.Open(opts)
-	if err != nil {
-		return nil, Classify(err)
-	}
-
-	pingCtx, cancel := context.WithTimeout(ctx, o.PingTimeout)
-	defer cancel()
-	if err := conn.Ping(pingCtx); err != nil {
-		_ = conn.Close()
-		return nil, Classify(err)
-	}
-	return conn, nil
+	return opts, nil
 }
 
 func compressionFor(name string) *ch.Compression {
@@ -207,6 +234,7 @@ func kindForServerError(code int32, message string) Kind {
 	}
 	lower := strings.ToLower(message)
 	if strings.Contains(lower, "too many sessions") ||
+		strings.Contains(lower, "overflown session count") ||
 		strings.Contains(lower, "max_sessions_for_user") ||
 		strings.Contains(lower, "is locked by a concurrent") ||
 		strings.Contains(lower, "session is locked") ||

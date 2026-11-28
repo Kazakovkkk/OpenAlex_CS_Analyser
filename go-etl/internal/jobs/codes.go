@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"go-etl/internal/adapters/api"
+	"go-etl/internal/adapters/s3"
 	"go-etl/internal/clickhouse"
 	"go-etl/internal/pipeline"
 )
@@ -49,6 +50,8 @@ func ErrorCode(err error) string {
 		return CodeSnapshotChanged
 	}
 	switch {
+	case errors.Is(err, s3.ErrManifestUnavailable):
+		return CodeManifestUnavailable
 	case errors.Is(err, pipeline.ErrCorpusIncomplete):
 		return CodeCorpusIncomplete
 	case errors.Is(err, pipeline.ErrRestartOfferExpired):

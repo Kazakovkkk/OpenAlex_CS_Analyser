@@ -243,13 +243,27 @@ func TestPrefetchMemoryStaysWithinBudget(t *testing.T) {
 		t.Fatalf("ReadAt: %v", err)
 	}
 
+	// Snapshot the windows under the mutex and wait for every window's ready
+	// signal before touching its buffer: background fetches write buf without
+	// holding the mutex.
 	ra.mu.Lock()
-	var windowCap int64
+	wins := make([]*spanWindow, len(ra.windows))
+	pending := make([]chan struct{}, len(ra.windows))
 	for i := range ra.windows {
-		windowCap += int64(cap(ra.windows[i].buf))
+		wins[i] = &ra.windows[i]
+		pending[i] = ra.windows[i].pending
 	}
-	nSpans := len(ra.windows)
 	ra.mu.Unlock()
+	for _, ready := range pending {
+		if ready != nil {
+			<-ready
+		}
+	}
+	var windowCap int64
+	for _, w := range wins {
+		windowCap += int64(cap(w.buf))
+	}
+	nSpans := len(wins)
 	allowed := max(budget, int64(nSpans)*minWindowSize)
 	if windowCap > allowed {
 		t.Fatalf("window capacity %d > allowed %d (spans=%d budget=%d)", windowCap, allowed, nSpans, budget)

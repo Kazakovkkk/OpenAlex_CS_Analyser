@@ -51,7 +51,7 @@ func TestStatePredicates(t *testing.T) {
 	t.Parallel()
 	snap := time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)
 
-	published := State{LoadState: LoadIdle, DataVersion: 1, SnapshotDate: &snap, ManifestID: "works-2026-10-14-abc"}
+	published := State{LoadState: LoadIdle, Phase: PhaseNone, DataVersion: 1, SnapshotDate: &snap, ManifestID: "works-2026-10-14-abc"}
 	if !published.Published() {
 		t.Fatal("Published() = false for a complete release")
 	}
@@ -76,7 +76,7 @@ func TestStatePredicates(t *testing.T) {
 		t.Fatal("ManifestMatches must be false while loading")
 	}
 
-	empty := State{LoadState: LoadIdle}
+	empty := State{LoadState: LoadIdle, Phase: PhaseNone}
 	if empty.Published() {
 		t.Fatal("an empty release must not be published")
 	}

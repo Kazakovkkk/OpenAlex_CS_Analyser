@@ -85,9 +85,9 @@ type ParquetInstitution struct {
 type JSONWork struct {
 	ID              string            `json:"id"`
 	Type            string            `json:"type"`
-	PublicationYear int32             `json:"publication_year"`
-	PublicationDate string            `json:"publication_date"`
-	UpdatedDate     string            `json:"updated_date"`
+	PublicationYear *int32            `json:"publication_year"`
+	PublicationDate *string           `json:"publication_date"`
+	UpdatedDate     *string           `json:"updated_date"`
 	IsRetracted     *bool             `json:"is_retracted"`
 	IsXPAC          bool              `json:"is_xpac"`
 	FWCI            *float64          `json:"fwci"`

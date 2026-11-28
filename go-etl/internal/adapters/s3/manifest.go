@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"path"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -18,6 +20,39 @@ const (
 	threshold15MB = 15 << 20
 	threshold20MB = 20 << 20
 )
+
+var (
+	// ErrManifestUnavailable marks a network/404/5xx failure while reading a
+	// required release manifest.
+	ErrManifestUnavailable = errors.New("s3: manifest unavailable")
+	// ErrManifestInvalid marks a manifest whose entity, format, date, file list
+	// or file keys do not satisfy the release contract.
+	ErrManifestInvalid = errors.New("s3: manifest invalid")
+)
+
+type ManifestUnavailableError struct {
+	Key string
+	Err error
+}
+
+func (e *ManifestUnavailableError) Error() string {
+	return fmt.Sprintf("s3: manifest %s is unavailable: %v", e.Key, e.Err)
+}
+
+func (e *ManifestUnavailableError) Unwrap() error { return e.Err }
+
+func (e *ManifestUnavailableError) Is(target error) bool { return target == ErrManifestUnavailable }
+
+type ManifestInvalidError struct {
+	Key    string
+	Reason string
+}
+
+func (e *ManifestInvalidError) Error() string {
+	return fmt.Sprintf("s3: manifest %s is invalid: %s", e.Key, e.Reason)
+}
+
+func (e *ManifestInvalidError) Is(target error) bool { return target == ErrManifestInvalid }
 
 type Manifest struct {
 	Date          string          `json:"date"`
@@ -98,9 +133,60 @@ func CombineIDs(parts ...string) string {
 func (c *Client) FetchManifest(ctx context.Context, key string) (*Manifest, error) {
 	raw, err := c.ReadAll(ctx, c.bucket, key, MaxManifestBytes)
 	if err != nil {
-		return nil, fmt.Errorf("fetch manifest %s: %w", key, err)
+		return nil, &ManifestUnavailableError{Key: key, Err: err}
 	}
-	return ParseManifest(raw)
+	m, err := ParseManifest(raw)
+	if err != nil {
+		return nil, &ManifestInvalidError{Key: key, Reason: err.Error()}
+	}
+	return m, nil
+}
+
+// Validate checks the release contract of one manifest: entity, Parquet format,
+// a real date, a non-empty file list and unique file keys/URLs.
+func (m *Manifest) Validate(entity string) error {
+	if m == nil {
+		return &ManifestInvalidError{Reason: "manifest is nil"}
+	}
+	if strings.TrimSpace(m.Entity) != entity {
+		return &ManifestInvalidError{Reason: fmt.Sprintf("entity is %q, want %q", m.Entity, entity)}
+	}
+	if strings.TrimSpace(strings.ToLower(m.Format)) != "parquet" {
+		return &ManifestInvalidError{Reason: fmt.Sprintf("format is %q, want parquet", m.Format)}
+	}
+	if _, err := time.Parse("2006-01-02", strings.TrimSpace(m.Date)); err != nil {
+		return &ManifestInvalidError{Reason: fmt.Sprintf("date %q is not YYYY-MM-DD", m.Date)}
+	}
+	if m.RecordCount < 0 {
+		return &ManifestInvalidError{Reason: fmt.Sprintf("record_count %d is negative", m.RecordCount)}
+	}
+	if len(m.Files) == 0 {
+		return &ManifestInvalidError{Reason: "file list is empty"}
+	}
+	seenURL := make(map[string]struct{}, len(m.Files))
+	seenKey := make(map[string]struct{}, len(m.Files))
+	for i, f := range m.Files {
+		raw := strings.TrimSpace(f.URL)
+		if raw == "" {
+			return &ManifestInvalidError{Reason: fmt.Sprintf("file %d has an empty url", i)}
+		}
+		_, key, err := ParseS3URL(raw)
+		if err != nil {
+			return &ManifestInvalidError{Reason: fmt.Sprintf("file %d: %v", i, err)}
+		}
+		if f.Meta.ContentLength < 0 {
+			return &ManifestInvalidError{Reason: fmt.Sprintf("file %d has a negative content_length", i)}
+		}
+		if _, dup := seenURL[raw]; dup {
+			return &ManifestInvalidError{Reason: fmt.Sprintf("duplicate url %q", raw)}
+		}
+		if _, dup := seenKey[key]; dup {
+			return &ManifestInvalidError{Reason: fmt.Sprintf("duplicate object key %q", key)}
+		}
+		seenURL[raw] = struct{}{}
+		seenKey[key] = struct{}{}
+	}
+	return nil
 }
 
 func ParseManifest(data []byte) (*Manifest, error) {

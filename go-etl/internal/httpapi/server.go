@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"go-etl/internal/adapters/api"
 	"go-etl/internal/jobs"
@@ -29,6 +30,7 @@ const (
 type Backend interface {
 	RunIngest(ctx context.Context, j *jobs.Job, req IngestRequest) error
 	RestartIngest(ctx context.Context, j *jobs.Job, req RestartRequest) error
+	PreviewRestart(ctx context.Context, token string) error
 	RunDimensions(ctx context.Context, j *jobs.Job, req DimensionsRequest) error
 	RunLoadtest(ctx context.Context, j *jobs.Job, req LoadtestRequest) error
 	RequestAPIKey(ctx context.Context, email string) (api.APIKeyResult, error)
@@ -67,6 +69,7 @@ type Server struct {
 	baseCtx    context.Context
 	instanceID string
 	mux        *http.ServeMux
+	draining   atomic.Bool
 }
 
 func New(manager *jobs.Manager, backend Backend, opts ...Option) *Server {
@@ -100,6 +103,8 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 type errorResponse struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code,omitempty"`
 }
@@ -116,11 +121,17 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func writeError(w http.ResponseWriter, status int, format string, args ...any) {
-	writeJSON(w, status, errorResponse{Error: fmt.Sprintf(format, args...)})
+	writeAPIError(w, status, "invalid_request", fmt.Sprintf(format, args...))
 }
 
 func writeErrorCode(w http.ResponseWriter, status int, code, format string, args ...any) {
-	writeJSON(w, status, errorResponse{Error: fmt.Sprintf(format, args...), ErrorCode: code})
+	writeAPIError(w, status, code, fmt.Sprintf(format, args...))
+}
+
+// writeAPIError emits the error contract: code, message and a compatible
+// legacy "error" string.
+func writeAPIError(w http.ResponseWriter, status int, code, msg string) {
+	writeJSON(w, status, errorResponse{Code: code, Message: msg, Error: msg, ErrorCode: code})
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, dst any) bool {
@@ -153,8 +164,11 @@ func (s *Server) startJob(w http.ResponseWriter, kind jobs.Kind, run jobs.Runner
 	j, err := s.manager.Start(s.baseCtx, kind, run)
 	if err != nil {
 		status := http.StatusInternalServerError
-		if errors.Is(err, jobs.ErrJobsLimit) {
+		switch {
+		case errors.Is(err, jobs.ErrJobsLimit):
 			status = http.StatusTooManyRequests
+		case errors.Is(err, jobs.ErrAdmissionClosed):
+			status = http.StatusServiceUnavailable
 		}
 		writeError(w, status, "%v", err)
 		return
@@ -162,7 +176,45 @@ func (s *Server) startJob(w http.ResponseWriter, kind jobs.Kind, run jobs.Runner
 	s.accepted(w, j)
 }
 
-// accepted answers with an already-running job (idempotent start).
+// startExclusive registers a corpus-writing job under the single write slot.
+// A repeat of the same operation (or the same restart token) returns 202 with
+// the existing job id; a competing operation gets 409 session_busy.
+func (s *Server) startExclusive(w http.ResponseWriter, kind jobs.Kind, token string, run jobs.Runner) {
+	j, duplicate, err := s.manager.StartExclusive(s.baseCtx, kind, token, run)
+	switch {
+	case errors.Is(err, jobs.ErrSessionBusy):
+		writeAPIError(w, http.StatusConflict, "session_busy", err.Error())
+		return
+	case errors.Is(err, jobs.ErrAdmissionClosed):
+		writeAPIError(w, http.StatusServiceUnavailable, "shutting_down", err.Error())
+		return
+	case errors.Is(err, jobs.ErrJobsLimit):
+		writeAPIError(w, http.StatusTooManyRequests, "too_many_jobs", err.Error())
+		return
+	case err != nil:
+		writeAPIError(w, http.StatusInternalServerError, "internal_error", err.Error())
+		return
+	}
+	if duplicate {
+		s.accepted(w, j)
+		return
+	}
+	s.accepted(w, j)
+}
+
+// BeginShutdown closes the admission of new write jobs before the active job
+// is stopped and awaited.
+func (s *Server) BeginShutdown() { s.draining.Store(true) }
+
+func (s *Server) writable(w http.ResponseWriter) bool {
+	if s.draining.Load() {
+		writeAPIError(w, http.StatusServiceUnavailable, "shutting_down", "server is shutting down")
+		return false
+	}
+	return true
+}
+
+// accepted answers with the existing job (idempotent start).
 func (s *Server) accepted(w http.ResponseWriter, j *jobs.Job) {
-	writeJSON(w, http.StatusAccepted, jobAccepted{JobID: j.ID(), InstanceID: s.instanceID, State: jobs.StateRunning})
+	writeJSON(w, http.StatusAccepted, jobAccepted{JobID: j.ID(), InstanceID: s.instanceID, State: j.State()})
 }

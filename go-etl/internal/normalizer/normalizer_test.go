@@ -263,8 +263,8 @@ func TestAppendPreservesRawFieldsWithoutValidation(t *testing.T) {
 	}
 	wFuture := &JSONWork{
 		ID:              "https://openalex.org/W1002",
-		PublicationYear: 2099,
-		PublicationDate: "2500-01-01",
+		PublicationYear: ptr(int32(2099)),
+		PublicationDate: ptr("2500-01-01"),
 		PrimaryTopic:    &JSONPrimaryTopic{Field: &JSONIDRef{ID: "https://openalex.org/fields/17"}},
 	}
 	wDirty := &ParquetWork{
@@ -281,12 +281,12 @@ func TestAppendPreservesRawFieldsWithoutValidation(t *testing.T) {
 
 	if n.AppendParquetWork(w1400, b) != OutcomeAdded ||
 		n.AppendJSONWork(wFuture, b) != OutcomeAdded ||
-		n.AppendParquetWork(wDirty, b) != OutcomeAdded ||
+		n.AppendParquetWork(wDirty, b) != OutcomeFilteredOut ||
 		n.AppendParquetWork(wDirty2, b) != OutcomeAdded {
-		t.Fatal("all 4 dirty CS records must be preserved for Task 1")
+		t.Fatal("retracted work must be filtered; the other dirty rows stay for Task 1")
 	}
 
-	assertWorksBatchColumnLengths(t, b, 4)
+	assertWorksBatchColumnLengths(t, b, 3)
 
 	if b.PubYears[0] != 1400 || b.PubDates[0] == nil || b.PubDates[0].Format("2006-01-02") != "1400-01-01" {
 		t.Fatalf("row 0 (1400): year=%d date=%v, want 1400 & 1400-01-01", b.PubYears[0], b.PubDates[0])
@@ -294,12 +294,8 @@ func TestAppendPreservesRawFieldsWithoutValidation(t *testing.T) {
 	if b.PubYears[1] != 2099 || b.PubDates[1] == nil || b.PubDates[1].Format("2006-01-02") != "2500-01-01" {
 		t.Fatalf("row 1 (2099): year=%d date=%v, want 2099 & 2500-01-01", b.PubYears[1], b.PubDates[1])
 	}
-	if b.WorkIDs[2] != 0 || b.PubYears[2] != 0 || b.PubDates[2] != nil || b.FWCIs[2] != nil ||
-		b.IsRetracted[2] != 1 || b.WorkTypes[2] != "" {
-		t.Fatalf("row 2 (dirty retracted record) not preserved properly")
-	}
-	if b.WorkIDs[3] != 0 {
-		t.Fatalf("row 3 WorkID = %d, want 0", b.WorkIDs[3])
+	if b.WorkIDs[2] != 0 {
+		t.Fatalf("row 2 WorkID = %d, want 0", b.WorkIDs[2])
 	}
 }
 
@@ -387,6 +383,8 @@ func TestParquetStructTagsRoundTrip(t *testing.T) {
 	topicOut := roundTripParquet(t, []ParquetTopic{{
 		ID:          ptr("https://openalex.org/T123"),
 		DisplayName: ptr("AI"),
+		Subfield:    &ParquetNamedRef{ID: ptr("https://openalex.org/subfields/1702"), DisplayName: ptr("Artificial Intelligence")},
+		Field:       &ParquetNamedRef{ID: ptr("https://openalex.org/fields/17"), DisplayName: ptr("Computer Science")},
 		UpdatedDate: ptr(int64(1791946884000000)),
 	}})
 	tb := sink.NewTopicsBatch(2)

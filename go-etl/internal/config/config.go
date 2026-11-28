@@ -63,6 +63,10 @@ type GoETL struct {
 	ETLWriterPassEnv string `toml:"etl_writer_password_env"`
 
 	GoPipelineWriterPassEnv string `toml:"go_pipeline_writer_password_env"`
+
+	// TestTarget marks a dedicated database where diagnostic runs (limits,
+	// an arbitrary S3 lower bound, a separate shard) are allowed to write.
+	TestTarget bool `toml:"test_target"`
 }
 
 // Load reads and validates a config file. An empty path means "no ClickHouse":

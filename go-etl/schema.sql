@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS pipeline_state
     analysis_data_version UInt64,
     analysis_snapshot_date Nullable(Date),
     analysis_completed_at Nullable(DateTime64(6, 'UTC')),
+    load_phase Enum8('none' = 0, 'resetting' = 1, 'full' = 2, 'incremental' = 3) DEFAULT 'none',
     CONSTRAINT singleton_state CHECK id = 1
 )
 ENGINE = MergeTree()

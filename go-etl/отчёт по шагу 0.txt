@@ -1,0 +1,100 @@
+# Шаг 0: Отчёт инспекции реального снепшота OpenAlex Parquet (`2026-10-14`)
+
+> **Источник:** публичный бакет `s3://openalex` (`us-east-1`, анонимный доступ без ключей).
+> **Воспроизведение:** `cd go-etl && go test -v -count=1 -tags=inspect ./internal/adapters/s3`
+> **Цель:** снять реальные схемы, форматы дат, веса колонок и диапазоны значений до заморозки `schema.sql` (ClickHouse) и разработки `Normalizer` / `S3 Parquet Adapter`.
+
+---
+
+## 1. Структура `manifest.json` и объёмы снепшота (база Метрики №2 — Data Funnel)
+
+В снепшоте `2026-10-14` OpenAlex использует новый формат `manifest.json` (плоские поля `date`, `format`, `entity`, `record_count`, `content_length` в корне + массив `"files"` вместо старого `"entries"`). Суммы по массиву `files` на 100% совпадают со сводными полями корня.
+
+| Сущность | Путь манифеста | Файлов | Объём (GiB / байт) | Записей | Размеры файлов (`min / median / p95 / max`) | `< 15 MiB` | `< 20 MiB` |
+|---|---|---:|---:|---:|---|---:|---:|
+| **`works` (Parquet)** | `data/parquet/works/manifest.json` | 1 898 | **692.94 GiB** (`744 042 462 611` B) | **464 765 485** | `62.56 KiB / 371.94 MiB / 770.38 MiB / 1020.76 MiB` | 270 (14.2%) | 276 (14.5%) |
+| **`topics` (Parquet)** | `data/parquet/topics/manifest.json` | 6 | **5.31 MiB** (`5 570 163` B) | **4 516** | `13.72 KiB / 23.69 KiB / 5.10 MiB / 5.10 MiB` | 6 (100.0%) | 6 (100.0%) |
+| **`institutions` (Parquet)** | `data/parquet/institutions/manifest.json` | 83 | **89.72 MiB** (`94 074 125` B) | **143 455** | `22.35 KiB / 24.95 KiB / 1.66 MiB / 43.02 MiB` | 81 (97.6%) | 81 (97.6%) |
+| **`works` (JSONL.gz)** | `data/jsonl/works/manifest.json` | 1 898 | **628.92 GiB** (`675 298 563 638` B) | **464 765 485** | — | — | — |
+
+**Ключевые выводы по хранению и Бенчмарку №3:**
+* **Гибрид `Full GET ↔ Buffered Range` подтверждён:** 100% `topics`, 97.6% `institutions` и 14.5% мелких `works` идут через быстрый `Full GET`; при этом 85.5% `works` имеют медиану `372 MiB` и максимум `1020.76 MiB` — их обязательно читать через буферизующий `s3ReaderAt` (`Range`) с projection pushdown.
+* **Идеальное сопоставление для Бенчмарка №3 (`JSONL.gz` vs `Parquet`):** JSONL лежит под `data/jsonl/works/` (а не `data/works/`), и у него **1-в-1 совпадение с Parquet** — ровно `1 898` файлов, `396/396` общих партиций `updated_date=...` и `464 765 485` записей. Полный Parquet на ~10% крупнее `JSONL.gz` (`692.94` vs `628.92 GiB`), поэтому экономия трафика достигается именно за счёт колоночного Projection Pushdown + `Buffered Range`.
+* **Подобранные файлы `works/` под линейку Бенчмарка №3 (`2 / 5 / 15 / 50 / 150 / 400 MiB`):**
+  * `2.03 MiB` (3 712 зап.): `s3://openalex/data/parquet/works/updated_date=2026-02-24/part_0000.parquet`
+  * `4.96 MiB` (7 110 зап.): `s3://openalex/data/parquet/works/updated_date=2026-04-11/part_0000.parquet`
+  * `14.90 MiB` (12 465 зап.): `s3://openalex/data/parquet/works/updated_date=2026-07-17/part_0000.parquet`
+  * `50.46 MiB` (176 609 зап.): `s3://openalex/data/parquet/works/updated_date=2026-08-13/part_0071.parquet`
+  * `150.04 MiB` (94 339 зап.): `s3://openalex/data/parquet/works/updated_date=2026-09-09/part_0011.parquet`
+  * `401.41 MiB` (365 174 зап.): `s3://openalex/data/parquet/works/updated_date=2026-08-26/part_0006.parquet`
+
+---
+
+## 2. Реальные схемы Parquet и важное уточнение формата 2026
+
+Все файлы сгенерированы `parquet-mr 1.12.3-databricks`, сжаты кодеком **`SNAPPY`** (коэффициент сжатия `2.00x–2.74x`), абсолютно все колонки имеют признак **`optional`** (могут быть `NULL`).
+
+### Главное архитектурное уточнение
+Вопреки первоначальному предположению, в снепшоте `2026-10-14` вложенные поля (`primary_topic`, `topics`, `keywords`, `authorships`, `primary_location`, `counts_by_year`) хранятся в Parquet **НЕ как JSON-строки, а как нативные вложенные структуры и списки (`LIST`/`GROUP`)** (`200` листовых колонок в `works`, `71` в `institutions`, `22` в `topics`).
+* **JSON-строкой (`STRING`) осталась только колонка `abstract_inverted_index`** — она же самая тяжёлая колонка файла (**22.98%** сжатого объёма), формат подтверждён: `{"word": [pos1, pos2], ...}`.
+* **`bytedance/sonic`** остаётся на горячем пути для `abstract_inverted_index`, `OpenAlex REST API Adapter` и `JSONL.gz` (Бенчмарки №3 и №4).
+
+### Реальные типы ключевых колонок `works` (Projection Pushdown: `36 / 200` листовых колонок)
+На тестовом файле `updated_date=2026-04-11/part_0000.parquet` (`4.90 MiB` payload, 7 110 строк) **36 целевых листовых колонок занимают `2.05 MiB` (41.96%)**, а **58.04% файла (`2.84 MiB`) полностью пропускаются** (на плотных академических партициях с длинными `referenced_works` и `locations` экономия составит **65–75%+**).
+
+| Группа | Точные пути листовых колонок Parquet | Физический / логический тип | Примечание |
+|---|---|---|---|
+| **Идентификаторы и тексты** | `id`, `doi`, `title`, `type`, `language` | `BYTE_ARRAY (STRING)` | `id`: `"https://openalex.org/W..."` |
+| **Даты** | `publication_date` | `INT32 (DATE)` | Дни от `1970-01-01` (без строкового парсинга!) |
+| | `created_date`, `updated_date` | `INT64 (TIMESTAMP, UTC, MICROS)` | Микросекунды от Unix epoch UTC |
+| **Скаляры и флаги** | `publication_year`, `authors_count`, `cited_by_count`, `referenced_works_count` | `INT32` | `authors_count` уже посчитан нативно (`2.66 KiB`) |
+| | `fwci` | `DOUBLE` | Конвертируем в `*float32` (`Nullable(Float32)`) |
+| | `is_retracted`, `is_xpac` | `BOOLEAN` | `is_xpac` весит всего `174 B` на файл |
+| **Темы** | `primary_topic.{id, score, field.id, subfield.id, domain.id}` | `STRING` / `FLOAT` | `primary_topic.field.id` = `"https://openalex.org/fields/17"` (`5.29 KiB`, `0.11%` файла) |
+| | `topics.list.element.{id, score}` | `STRING` / `FLOAT` | Нативный список |
+| **Ключевые слова** | `keywords.list.element.{display_name, score}` | `STRING` / `FLOAT` | Нормализуем регистр (`ToLower + TrimSpace`) |
+| **Авторство** | `authorships.list.element.{author.id, author_position, countries.list.element, institutions.list.element.id, institutions.list.element.country_code}` | `STRING` | `country_code` → `ToUpper` (ISO-2) |
+| **Источник** | `primary_location.{source.id, source.display_name, source.type, is_oa}` | `STRING` / `BOOLEAN` | |
+| **Цитирования по годам** | `counts_by_year.list.element.{year, cited_by_count}` | `INT32` / `INT32` | Нативный список |
+| **Аннотация** | `abstract_inverted_index` | `BYTE_ARRAY (STRING)` | Единственный JSON (`22.98%` веса файла) → `sonic` + $O(N)$-сборка (лимит `32 KiB`) |
+
+### Ключевые поля справочников
+* **`dim_topics` (`topics/`, 22 колонки):** `id` (`T10001`), `display_name`, `description`, `subfield.{id, display_name}`, `field.{id, display_name}`, `domain.{id, display_name}`, `works_count (INT32)`, `cited_by_count (INT32)`, `updated_date / created_date (TIMESTAMP MICROS)`.
+* **`dim_institutions` (`institutions/`, 71 колонка):** `id` (`I2799651439`), `ror`, `display_name`, `country_code` (`"US"`), `type`, `lineage.list.element[]`, `geo.{city, region, country, country_code, latitude, longitude}`, `works_count (INT32)`, `cited_by_count (INT32)`, `summary_stats.h_index (INT32)`, `status`, `updated_date / created_date (TIMESTAMP MICROS)`.
+
+---
+
+## 3. Профилирование значений и пре-фильтра (`53 970` строк из 3 партиций, `49.89 MiB`)
+
+Файлы: `2026-04-11/part_0000` (7 110 строк), `2026-07-17/part_0000` (12 465 строк), `2025-12-23/part_0000` (34 395 строк).
+Скорость однопоточного сканирования 12 колонок через `parquet.NewGenericReader`: **`141 483 строк/сек`** (`381 ms` на 53 970 строк).
+
+| Показатель | Наблюдаемое значение (53 970 строк) | Вывод / действие |
+|---|---|---|
+| `referenced_works_count` | `max = 165`, `>uint16 = 0`, `<0 = 0` | См. рекомендации для `schema.sql` ниже |
+| `authors_count` | `max = 96`, `>uint16 = 0`, **`==0`: 17 062 (31.61%)**, `null = 0` | `UInt16` достаточно; 31.61% без авторов — ценный сигнал для Задачи 1 |
+| `cited_by_count` | `max = 681`, `>uint16 = 0` | В полном корпусе топ-статьи имеют `> 100 000` цитирований → строго `UInt32` |
+| `publication_year` | `min = 1400`, `max = 2026`, `null = 819 (1.52%)`, **`<1900 = 64`** | `UInt16` (`NULL` → `0`); сохраняем «битые» годы для Задачи 1 |
+| `publication_date` | `min = 1400-01-01 (-208188)`, `max = 2026-08-14`, `null = 819`, **`<1900 = 64`** | **Критично:** `Nullable(Date32)`! Даты `< 1900-01-01` и `> 2299-12-31` обязательно превращаем в `NULL` |
+| `doi` / `title` null или пустые | `doi`: **9.27%** (5 001), `title`: **6.51%** (3 512) | Храним как `""` (не удаляем — ищет Задача 1) |
+| `fwci == NULL` | **47.37%** (25 568) | Подтверждает `Nullable(Float32)` |
+| `abstract_inverted_index` | Пусто: **70.62%**, `> 32 KiB`: `0`, **`max = 31.99 KiB`** | Лимит `32 KiB` при сборке абстракта полностью адекватен |
+| `is_xpac` | `true`: **9.62%** (5 194), `false`: **90.38%**, `null = 0` | Надёжный булев флаг для раннего отсечения |
+| Пре-фильтр CS (`fields/17`) | `exact = 1 615`, `suffix = 1 615`, `contains = 1 615` (**`mismatches = 0`**) | На нативной колонке `primary_topic.field.id` — `0` ложных срабатываний |
+| **Целевой выход (`!is_xpac && fields/17`)** | **1 524 / 53 970 (`2.82%`)** | **~97.2%** записей отсекаются до `sonic`/абстракта; оценка всего CS-корпуса: **~13–18 млн статей** |
+
+---
+
+## 4. Итоговые рекомендации для заморозки `schema.sql` (Коллега 1) и аналитики (Коллега 2)
+
+1. **Типы счётчиков в `works` (`ClickHouse`):**
+   * `cited_by_count` → **`UInt32`** (у топ-статей CS > 65 535 цитирований).
+   * `referenced_works_count` → рекомендуем **`UInt32`** (минимальная доплата после LZ4/ZSTD, защита от редких мега-обзоров > 65 535; альтернатива `UInt16` с насыщением до `65535`).
+   * `authors_count` → **`UInt16`** (запас до 65 535 перекрывает любые коллаборации + clamp в нормализаторе).
+   * `publication_year` → **`UInt16`** (`NULL` → `0`).
+2. **Даты и `Nullable`:**
+   * `publication_date` → **`Nullable(Date32)`** (`1900-01-01 .. 2299-12-31`, вне окна → `NULL`).
+   * `fwci` → **`Nullable(Float32)`** (`NULL` у ~47% записей).
+   * `created_date`, `updated_date` → **`DateTime64(6, 'UTC')`** (или `DateTime('UTC')`, если микросекунды не нужны аналитике — согласовать с Коллегой 1).
+   * Все остальные строки (`doi`, `title`, `abstract`, `language`, `work_type`, `first_author_country`) — не-Nullable `String` / `LowCardinality(String)` с пустой строкой `""` при отсутствии.
+3. **Готово к согласованию для `WorksBatch` (Шаг 2):** точный набор колонок в таблицах `works`, `dim_topics`, `dim_institutions` (особенно: нужны ли `primary_location.source.display_name` и `keywords.score`, или достаточно ID/имён).

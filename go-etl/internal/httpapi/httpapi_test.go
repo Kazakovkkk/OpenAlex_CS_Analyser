@@ -51,8 +51,13 @@ func (f *fakeBackend) RunIngest(ctx context.Context, j *jobs.Job, req IngestRequ
 	return nil
 }
 
-func (f *fakeBackend) RunDimensions(ctx context.Context, j *jobs.Job, req DimensionsRequest) error {
+func (f *fakeBackend) PreviewRestart(_ context.Context, _ string) error {
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.restartErr
+}
+
+func (f *fakeBackend) RunDimensions(ctx context.Context, j *jobs.Job, req DimensionsRequest) error {	f.mu.Lock()
 	f.dimensions = req
 	block := f.block
 	f.mu.Unlock()
@@ -329,20 +334,42 @@ func TestJobsLimitResponse(t *testing.T) {
 
 	be := &fakeBackend{block: true}
 	srv, _ := newTestServer(t, be)
-	paths := []string{
-		"/api/v1/ingest/start",
-		"/api/v1/dimensions/sync",
-		"/api/v1/loadtest/start",
-		"/api/v1/loadtest/start",
+
+	if rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{}`); rec.Code != http.StatusAccepted {
+		t.Fatalf("ingest start status = %d, body=%s", rec.Code, rec.Body)
 	}
-	for i, p := range paths {
-		if rec := doRequest(t, srv, http.MethodPost, p, `{}`); rec.Code != http.StatusAccepted {
-			t.Fatalf("start %d (%s) status = %d, body=%s", i, p, rec.Code, rec.Body)
+	// dimensions/sync competes for the same write slot as ingest.
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/dimensions/sync", `{}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("competing dimensions status = %d, want 409, body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "session_busy") {
+		t.Fatalf("body = %s, want session_busy", rec.Body)
+	}
+
+	// The load test is not a corpus writer and still runs in parallel until
+	// the global job limit is reached (ingest + 3 load tests = 4).
+	for i := 0; i < 3; i++ {
+		if rec := doRequest(t, srv, http.MethodPost, "/api/v1/loadtest/start", `{}`); rec.Code != http.StatusAccepted {
+			t.Fatalf("loadtest start %d status = %d, body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	rec := doRequest(t, srv, http.MethodPost, "/api/v1/loadtest/start", `{}`)
+	rec = doRequest(t, srv, http.MethodPost, "/api/v1/loadtest/start", `{}`)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429, body=%s", rec.Code, rec.Body)
+	}
+}
+
+func TestIngestStartRejectsRESTSource(t *testing.T) {
+	t.Parallel()
+
+	srv, _ := newTestServer(t, &fakeBackend{})
+	rec := doRequest(t, srv, http.MethodPost, "/api/v1/ingest/start", `{"source":"api"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "rest_manual_only") {
+		t.Fatalf("body = %s, want rest_manual_only", rec.Body)
 	}
 }
 

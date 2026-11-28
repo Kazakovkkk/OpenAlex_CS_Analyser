@@ -74,6 +74,10 @@ type Snapshot struct {
 	Error        string `json:"error"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	RestartToken string `json:"restart_token,omitempty"`
+
+	PreviousSnapshotDate  string                  `json:"previous_snapshot_date,omitempty"`
+	AvailableSnapshotDate string                  `json:"available_snapshot_date,omitempty"`
+	TargetDatabase        *pipeline.TargetDatabase `json:"target_database,omitempty"`
 }
 
 type Runner func(ctx context.Context, j *Job) error
@@ -148,10 +152,25 @@ func (j *Job) Snapshot() Snapshot {
 		errText = j.err.Error()
 	}
 	errCode := j.errCode
-	var restartToken string
+	var (
+		restartToken   string
+		previousSnap   string
+		availableSnap  string
+		targetDatabase *pipeline.TargetDatabase
+	)
 	var changed *pipeline.SnapshotChangedError
 	if errors.As(j.err, &changed) {
 		restartToken = changed.Token
+		if changed.PreviousSnapshotDate != nil {
+			previousSnap = changed.PreviousSnapshotDate.Format("2006-01-02")
+		}
+		if changed.AvailableSnapshotDate != nil {
+			availableSnap = changed.AvailableSnapshotDate.Format("2006-01-02")
+		}
+		if changed.TargetDatabase.Database != "" {
+			target := changed.TargetDatabase
+			targetDatabase = &target
+		}
 	}
 	started := j.startedAt
 	finished := j.finishedAt
@@ -190,6 +209,10 @@ func (j *Job) Snapshot() Snapshot {
 		Error:            errText,
 		ErrorCode:        errCode,
 		RestartToken:     restartToken,
+
+		PreviousSnapshotDate:  previousSnap,
+		AvailableSnapshotDate: availableSnap,
+		TargetDatabase:        targetDatabase,
 	}
 }
 
@@ -197,11 +220,18 @@ type Manager struct {
 	mu             sync.Mutex
 	seq            map[Kind]int
 	jobs           map[string]*Job
+	write          *Job
+	tokens         map[string]*Job
+	admissionClosed bool
 	MetricsFactory func() *metrics.JobMetrics
 }
 
 func NewManager() *Manager {
-	return &Manager{seq: make(map[Kind]int, 3), jobs: make(map[string]*Job, 8)}
+	return &Manager{
+		seq:    make(map[Kind]int, 3),
+		jobs:   make(map[string]*Job, 8),
+		tokens: make(map[string]*Job, 4),
+	}
 }
 
 func (m *Manager) newMetrics() *metrics.JobMetrics {
@@ -211,23 +241,117 @@ func (m *Manager) newMetrics() *metrics.JobMetrics {
 	return metrics.NewJobMetrics()
 }
 
-var ErrJobsLimit = errors.New("jobs: too many running jobs")
+var (
+	ErrJobsLimit = errors.New("jobs: too many running jobs")
+	// ErrSessionBusy means another write operation owns the single write slot.
+	ErrSessionBusy = errors.New("jobs: another write operation is in progress")
+	// ErrAdmissionClosed means shutdown has started and new write jobs are
+	// refused.
+	ErrAdmissionClosed = errors.New("jobs: write admission is closed")
+)
 
 const MaxRunningJobs = 4
 
+// Start creates a non-exclusive job (the load test uses it).
 func (m *Manager) Start(parent context.Context, kind Kind, run Runner) (*Job, error) {
 	if run == nil {
 		return nil, errors.New("jobs: nil runner")
 	}
 	m.mu.Lock()
+	if m.admissionClosed {
+		m.mu.Unlock()
+		return nil, ErrAdmissionClosed
+	}
 	if m.runningLocked() >= MaxRunningJobs {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("%w (limit %d)", ErrJobsLimit, MaxRunningJobs)
 	}
+	j := m.newJobLocked(parent, kind)
+	m.jobs[j.id] = j
+	m.mu.Unlock()
+
+	m.launch(j, run)
+	return j, nil
+}
+
+// StartExclusive registers a corpus-writing job under the single write slot.
+//
+//	duplicate == true  — the same operation is already active (or the same
+//	                     restart token was already accepted): the caller returns
+//	                     the existing job id.
+//	ErrSessionBusy     — a different corpus-writing operation is active.
+//
+// The token is checked before the common limit, so a repeated restart token
+// returns the same job even while another operation is running.
+func (m *Manager) StartExclusive(parent context.Context, kind Kind, token string, run Runner) (*Job, bool, error) {
+	if run == nil {
+		return nil, false, errors.New("jobs: nil runner")
+	}
+	m.mu.Lock()
+	if token != "" {
+		if j, ok := m.tokens[token]; ok {
+			m.mu.Unlock()
+			return j, true, nil
+		}
+	}
+	if m.admissionClosed {
+		m.mu.Unlock()
+		return nil, false, ErrAdmissionClosed
+	}
+	if m.write != nil && m.write.running() {
+		if m.write.kind == kind {
+			j := m.write
+			m.mu.Unlock()
+			return j, true, nil
+		}
+		j := m.write
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("%w (job %s is %s)", ErrSessionBusy, j.id, j.kind)
+	}
+	if m.runningLocked() >= MaxRunningJobs {
+		m.mu.Unlock()
+		return nil, false, fmt.Errorf("%w (limit %d)", ErrJobsLimit, MaxRunningJobs)
+	}
+	j := m.newJobLocked(parent, kind)
+	m.jobs[j.id] = j
+	m.write = j
+	if token != "" {
+		m.tokens[token] = j
+	}
+	m.mu.Unlock()
+
+	m.launch(j, run)
+	return j, false, nil
+}
+
+// FindByToken returns an already accepted restart job.
+func (m *Manager) FindByToken(token string) (*Job, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.tokens[token]
+	return j, ok
+}
+
+// CloseAdmission stops accepting new corpus-writing jobs. Called before the
+// active job is stopped during shutdown.
+func (m *Manager) CloseAdmission() {
+	m.mu.Lock()
+	m.admissionClosed = true
+	m.mu.Unlock()
+}
+
+// AdmissionClosed reports the shutdown gate state.
+func (m *Manager) AdmissionClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.admissionClosed
+}
+
+func (m *Manager) newJobLocked(parent context.Context, kind Kind) *Job {
 	m.seq[kind]++
 	id := fmt.Sprintf("%s-%d", kind.prefix(), m.seq[kind])
 	ctx, cancel := context.WithCancel(parent)
-	j := &Job{
+	return &Job{
 		id:        id,
 		kind:      kind,
 		metrics:   m.newMetrics(),
@@ -237,14 +361,14 @@ func (m *Manager) Start(parent context.Context, kind Kind, run Runner) (*Job, er
 		state:     StateRunning,
 		startedAt: time.Now(),
 	}
-	m.jobs[id] = j
-	m.mu.Unlock()
+}
 
+func (m *Manager) launch(j *Job, run Runner) {
 	go func() {
 		defer close(j.done)
-		defer cancel()
+		defer j.cancel()
 
-		err := run(ctx, j)
+		err := run(j.ctx, j)
 		j.metrics.Finish()
 
 		j.mu.Lock()
@@ -254,14 +378,27 @@ func (m *Manager) Start(parent context.Context, kind Kind, run Runner) (*Job, er
 			j.state = StateFailed
 			j.err = err
 			j.errCode = ErrorCode(err)
-		case ctx.Err() != nil:
+		case j.ctx.Err() != nil:
 			j.state = StateStopped
 		default:
 			j.state = StateCompleted
 		}
 		j.mu.Unlock()
+
+		// Never hold j.mu while taking m.mu; the manager may inspect the
+		// running state under its own lock.
+		m.mu.Lock()
+		if m.write == j {
+			m.write = nil
+		}
+		m.mu.Unlock()
 	}()
-	return j, nil
+}
+
+func (j *Job) running() bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.state == StateRunning
 }
 
 func (m *Manager) runningLocked() int {

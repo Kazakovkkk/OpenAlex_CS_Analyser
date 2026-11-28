@@ -72,19 +72,21 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `go-etl — OpenAlex -> ClickHouse ETL (MVP)
+	fmt.Fprint(os.Stderr, `go-etl — OpenAlex -> ClickHouse ETL
 
 usage:
-  etl serve     [--config PATH] [--addr :8081] [--sample PATH] [--checkpoint-dir DIR]
-  etl ingest    [--config PATH] [--source s3|api] [--workers N] [--batch-size N]
+  etl serve     --config PATH [--addr :8081] [--dry-run]
+  etl ingest    --config PATH [--source s3|api] [--workers N] [--batch-size N]
                 [--shard-index I --shard-total N] [--max-files N] [--max-records N]
                 [--from-date YYYY-MM-DD] [--date-filter-mode updated|created|publication]
                 [--api-key KEY | $OPENALEX_API_KEY] [--rps-limit N]
-                [--full-get-threshold-mb N] [--checkpoint-dir DIR]
-  etl sync-dims [--config PATH] [--force-reload]
-  etl loadtest  [--config PATH] [--target-rps N] [--duration 30] [--workers N] [--batch-size N] [--sample PATH]
+                [--full-get-threshold-mb N] [--dry-run]
+  etl sync-dims --config PATH [--force-reload] [--dry-run]
+  etl loadtest  [--config PATH] [--target-rps N] [--duration 30] [--workers N]
+                [--batch-size N] [--sample PATH] [--dry-run]
 
-Without --config every batch goes to the diagnostic NoopSink.
+A working config is required. --dry-run selects the diagnostic NoopSink
+(and the load test uses works_loadtest when a config is given).
 `)
 }
 
@@ -117,10 +119,11 @@ func startCPUProfile(path string) (func(), error) {
 
 func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
+	cfgPath := fs.String("config", "", "path to config/app.toml (required unless --dry-run)")
+	dryRun := fs.Bool("dry-run", false, "explicit diagnostic run: NoopSink, no state/checkpoints")
 	addr := fs.String("addr", ":8081", "HTTP listen address")
 	sample := fs.String("sample", loadtest.DefaultSamplePath, "local JSONL.gz for the load test")
-	ckDir := fs.String("checkpoint-dir", filepath.Join("tmp", "checkpoints"), "checkpoint directory")
+	ckDir := fs.String("checkpoint-dir", filepath.Join("tmp", "checkpoints"), "diagnostic checkpoint directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -129,7 +132,7 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	st, err := openStores(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger, *dryRun)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
@@ -146,6 +149,11 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 		APIKey:        app.ResolveAPIKey(""),
 		CheckpointDir: *ckDir,
 		SamplePath:    *sample,
+		TestTarget:    st.testTarget,
+		TargetHost:    st.targetHost,
+		TargetPort:    st.targetPort,
+		LoadtestSink:  st.loadtestSink,
+		Keys:          api.NewKeyStore(),
 	}, logger)
 
 	manager := jobs.NewManager()
@@ -181,11 +189,14 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Close the admission of new write jobs first, then stop the active job and
+	// wait for its final flush (spec step 1.4).
+	srv.BeginShutdown()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("http shutdown", "err", err)
+	}
 	if err := manager.StopAll(shutdownCtx); err != nil {
 		logger.Warn("jobs did not stop cleanly", "err", err)
-	}
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("http shutdown: %w", err)
 	}
 	return nil
 }
@@ -214,7 +225,8 @@ func runOneJob(ctx context.Context, logger *slog.Logger, manager *jobs.Manager, 
 
 func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
+	cfgPath := fs.String("config", "", "path to config/app.toml (required unless --dry-run)")
+	dryRun := fs.Bool("dry-run", false, "explicit diagnostic run: NoopSink, no state/checkpoints")
 	source := fs.String("source", "s3", "data source: s3 or api")
 	workers := fs.Int("workers", 4, "parallel file workers")
 	batchSize := fs.Int("batch-size", sink.DefaultBatchCap, "rows per batch")
@@ -243,7 +255,7 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	st, err := openStores(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger, *dryRun)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
@@ -261,6 +273,9 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 		APIKey:           resolvedKey,
 		CheckpointDir:    *ckDir,
 		FullGetThreshold: int64(*fullGetMB) << 20,
+		TestTarget:       st.testTarget,
+		TargetHost:       st.targetHost,
+		TargetPort:       st.targetPort,
 	}, logger)
 	manager := jobs.NewManager()
 
@@ -289,7 +304,8 @@ func runIngest(ctx context.Context, logger *slog.Logger, args []string) error {
 
 func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("sync-dims", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "path to config/app.toml (ClickHouse sink); empty = diagnostic NoopSink")
+	cfgPath := fs.String("config", "", "path to config/app.toml (required unless --dry-run)")
+	dryRun := fs.Bool("dry-run", false, "explicit diagnostic run: NoopSink, no state/checkpoints")
 	force := fs.Bool("force-reload", true, "reload dictionaries even if they look fresh")
 	cpuProfile := fs.String("cpuprofile", "", "write a pprof CPU profile here")
 	if err := fs.Parse(args); err != nil {
@@ -305,13 +321,14 @@ func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error 
 	if err != nil {
 		return fmt.Errorf("s3 client: %w", err)
 	}
-	st, err := openStores(ctx, *cfgPath, logger)
+	st, err := openStores(ctx, *cfgPath, logger, *dryRun)
 	if err != nil {
 		return fmt.Errorf("sink: %w", err)
 	}
 	defer st.Close()
 
-	backend := app.New(app.Config{S3: s3Client, Sink: st.sink, Pipeline: st.pipeline, Checkpoints: st.checkpoints}, logger)
+	backend := app.New(app.Config{S3: s3Client, Sink: st.sink, Pipeline: st.pipeline, Checkpoints: st.checkpoints,
+		TestTarget: st.testTarget, TargetHost: st.targetHost, TargetPort: st.targetPort}, logger)
 	manager := jobs.NewManager()
 	return runOneJob(ctx, logger, manager, jobs.KindDimensions, func(ctx context.Context, j *jobs.Job) error {
 		return backend.RunDimensions(ctx, j, httpapi.DimensionsRequest{ForceReload: *force})
@@ -320,6 +337,8 @@ func runSyncDims(ctx context.Context, logger *slog.Logger, args []string) error 
 
 func runLoadtest(ctx context.Context, logger *slog.Logger, args []string) error {
 	fs := flag.NewFlagSet("loadtest", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "config/app.toml; empty = diagnostic NoopSink")
+	dryRun := fs.Bool("dry-run", false, "explicit diagnostic run: NoopSink")
 	targetRPS := fs.Int("target-rps", loadtest.DefaultTargetRPS, "written rows per second")
 	duration := fs.Int("duration", loadtest.DefaultDurationSec, "duration in seconds")
 	workers := fs.Int("workers", loadtest.DefaultWorkers, "generator goroutines")
@@ -329,13 +348,27 @@ func runLoadtest(ctx context.Context, logger *slog.Logger, args []string) error 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// A load test without a config stays diagnostic; with a config it writes the
+	// dedicated works_loadtest table.
+	if *cfgPath == "" {
+		*dryRun = true
+	}
+	st, err := openStores(ctx, *cfgPath, logger, *dryRun)
+	if err != nil {
+		return fmt.Errorf("sink: %w", err)
+	}
+	defer st.Close()
 	stopProfile, err := startCPUProfile(*cpuProfile)
 	if err != nil {
 		return err
 	}
 	defer stopProfile()
 
-	backend := app.New(app.Config{Sink: sink.NewNoopSink(), SamplePath: *sample}, logger)
+	backend := app.New(app.Config{
+		Sink:         st.sink,
+		LoadtestSink: st.loadtestSink,
+		SamplePath:   *sample,
+	}, logger)
 	manager := jobs.NewManager()
 	return runOneJob(ctx, logger, manager, jobs.KindLoadTest, func(ctx context.Context, j *jobs.Job) error {
 		return backend.RunLoadtest(ctx, j, httpapi.LoadtestRequest{

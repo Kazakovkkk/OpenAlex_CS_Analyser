@@ -12,48 +12,58 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", InstanceID: s.instanceID})
 }
 
-// handleIngestRestart clears the corpus and reloads it, but only with a valid
-// one-shot token issued when the release changed (spec §4.4).
+// handleIngestRestart accepts a one-shot restart token. A token already
+// accepted in this process returns the same job before the common write limit
+// is checked; an expired or unknown token is 409 restart_offer_expired.
 func (s *Server) handleIngestRestart(w http.ResponseWriter, r *http.Request) {
-	if !s.requireBackend(w) {
+	if !s.requireBackend(w) || !s.writable(w) {
 		return
 	}
 	var req RestartRequest
 	if !s.decode(w, r, &req) {
 		return
 	}
-	if strings.TrimSpace(req.RestartToken) == "" {
-		writeErrorCode(w, http.StatusBadRequest, "restart_offer_expired", "restart_token is required")
+	token := strings.TrimSpace(req.RestartToken)
+	if token == "" {
+		writeAPIError(w, http.StatusBadRequest, "restart_offer_expired", "restart_token is required")
 		return
 	}
-	if j := s.manager.RunningOfKind(jobs.KindIngest); j != nil {
+	if j, ok := s.manager.FindByToken(token); ok {
 		s.accepted(w, j)
 		return
 	}
-	s.startJob(w, jobs.KindIngest, func(ctx context.Context, j *jobs.Job) error {
+	if err := s.backend.PreviewRestart(r.Context(), token); err != nil {
+		code := jobs.ErrorCode(err)
+		if code == "" {
+			code = jobs.CodeRestartOfferExpired
+		}
+		status := http.StatusConflict
+		if code == jobs.CodeClickHouseUnavailable {
+			status = http.StatusServiceUnavailable
+		}
+		writeAPIError(w, status, code, err.Error())
+		return
+	}
+	s.startExclusive(w, jobs.KindIngest, token, func(ctx context.Context, j *jobs.Job) error {
 		return s.backend.RestartIngest(ctx, j, req)
 	})
 }
 
 func (s *Server) handleDimensionsSync(w http.ResponseWriter, r *http.Request) {
-	if !s.requireBackend(w) {
+	if !s.requireBackend(w) || !s.writable(w) {
 		return
 	}
 	var req DimensionsRequest
 	if !s.decode(w, r, &req) {
 		return
 	}
-	if j := s.manager.RunningOfKind(jobs.KindDimensions); j != nil {
-		s.accepted(w, j)
-		return
-	}
-	s.startJob(w, jobs.KindDimensions, func(ctx context.Context, j *jobs.Job) error {
+	s.startExclusive(w, jobs.KindDimensions, "", func(ctx context.Context, j *jobs.Job) error {
 		return s.backend.RunDimensions(ctx, j, req)
 	})
 }
 
 func (s *Server) handleIngestStart(w http.ResponseWriter, r *http.Request) {
-	if !s.requireBackend(w) {
+	if !s.requireBackend(w) || !s.writable(w) {
 		return
 	}
 	var req IngestRequest
@@ -61,14 +71,23 @@ func (s *Server) handleIngestStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := req.normalize(); err != nil {
-		writeError(w, http.StatusBadRequest, "%v", err)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if j := s.manager.RunningOfKind(jobs.KindIngest); j != nil {
-		s.accepted(w, j)
+	// The REST source is a manual/test mode; the stock HTTP path always loads
+	// the S3 corpus. Python must not switch the working corpus to a REST plan.
+	if req.Source == SourceAPI {
+		writeAPIError(w, http.StatusBadRequest, "rest_manual_only",
+			"REST ingest is available only in manual CLI mode on a dedicated target")
 		return
 	}
-	s.startJob(w, jobs.KindIngest, func(ctx context.Context, j *jobs.Job) error {
+	// The stock HTTP path owns the whole corpus: one shard only.
+	if req.ShardTotal != 1 || req.ShardIndex != 0 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_request",
+			"the HTTP ingest runs one shard (shard_total=1, shard_index=0); use the CLI for a separate shard")
+		return
+	}
+	s.startExclusive(w, jobs.KindIngest, "", func(ctx context.Context, j *jobs.Job) error {
 		return s.backend.RunIngest(ctx, j, req)
 	})
 }
@@ -82,7 +101,7 @@ func (s *Server) handleLoadtestStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := req.normalize(); err != nil {
-		writeError(w, http.StatusBadRequest, "%v", err)
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	s.startJob(w, jobs.KindLoadTest, func(ctx context.Context, j *jobs.Job) error {
@@ -93,12 +112,12 @@ func (s *Server) handleLoadtestStart(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("job_id"))
 	if id == "" {
-		writeError(w, http.StatusBadRequest, "job_id is required")
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "job_id is required")
 		return
 	}
 	snap, ok := s.manager.Snapshot(id)
 	if !ok {
-		writeError(w, http.StatusNotFound, "job %q not found", id)
+		writeAPIError(w, http.StatusNotFound, "not_found", "job not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, snap)
@@ -107,11 +126,11 @@ func (s *Server) handleJob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleJobStop(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(r.PathValue("job_id"))
 	if id == "" {
-		writeError(w, http.StatusBadRequest, "job_id is required")
+		writeAPIError(w, http.StatusBadRequest, "invalid_request", "job_id is required")
 		return
 	}
 	if _, ok := s.manager.Get(id); !ok {
-		writeError(w, http.StatusNotFound, "job %q not found", id)
+		writeAPIError(w, http.StatusNotFound, "not_found", "job not found")
 		return
 	}
 	writeJSON(w, http.StatusOK, stopResponse{Stopped: s.manager.Stop(id)})
@@ -127,12 +146,13 @@ func (s *Server) handleRequestKey(w http.ResponseWriter, r *http.Request) {
 	}
 	email := strings.TrimSpace(req.Email)
 	if email == "" || !strings.Contains(email, "@") {
-		writeError(w, http.StatusBadRequest, "a valid email is required")
+		writeAPIError(w, http.StatusBadRequest, "email_required", "a valid email is required")
 		return
 	}
 	res, err := s.backend.RequestAPIKey(r.Context(), email)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "openalex api-keys request failed: %v", err)
+		writeAPIError(w, http.StatusBadGateway, "openalex_request_failed",
+			"openalex api-keys request failed: "+err.Error())
 		return
 	}
 	msg := strings.TrimSpace(res.Message)

@@ -5,7 +5,18 @@
     pipeline_writer создаются в local/init/01-users.sql, потому что гранты
     нельзя выдать пользователю из users.xml: ClickHouse хранит их в
     users_xml и отвечает ACCESS_STORAGE_READONLY (проверено на 26.9).
+
+    Профиль pipeline_limited задаёт max_sessions_for_user=1: настройка
+    read-only на уровне пользователя, поэтому вынесена в профиль и
+    назначается SQL-пользователю в 01-users.sql. Это тот же механизм,
+    который действует на VPS: Go и Python ходят одним логином с разными
+    паролями и делят один физический слот.
   -->
+  <profiles>
+    <pipeline_limited>
+      <max_sessions_for_user>1</max_sessions_for_user>
+    </pipeline_limited>
+  </profiles>
   <users>
     <default>
       <access_management>1</access_management>

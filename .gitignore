@@ -21,7 +21,10 @@ tmp/
 .idea/
 .vscode/
 
-# Reports are deliverables now: they must be committed, so docs/ is NOT ignored.
-# Only ad-hoc scratch notes and secrets stay out of the repository.
-docs/
-*.txt
+# Reports and specs are deliverables: docs/ is tracked.
+# Only ad-hoc scratch output stays out of the repository.
+logs/
+dist/
+*_out.txt
+**/internal/adapters/s3/*.txt
+**/config/app.vps.toml

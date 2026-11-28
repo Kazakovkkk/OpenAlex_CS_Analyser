@@ -6,13 +6,15 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
 const deleteChunk = 5000
 
 // DeleteWorks removes every stored version of the given work ids and verifies
 // that none of them is readable any more. It returns how many ids were removed.
-func DeleteWorks(ctx context.Context, conn Conn, database string, ids []uint64) (int64, error) {
+func DeleteWorks(ctx context.Context, conn driver.Conn, database string, ids []uint64) (int64, error) {
 	if conn == nil {
 		return 0, errors.New("pipeline: nil connection for deletions")
 	}

@@ -185,9 +185,16 @@ func TestProcessDimensionsFiles(t *testing.T) {
 	t.Parallel()
 
 	topicBytes := buildParquetBytes(t, []normalizer.ParquetTopic{
-		{ID: testPtr("https://openalex.org/T10001"), DisplayName: testPtr("Machine Learning")},
-		{ID: testPtr("https://openalex.org/T10002"), DisplayName: testPtr("Databases")},
-		{ID: testPtr("https://openalex.org/T10003"), DisplayName: testPtr("Compilers")},
+		{ID: testPtr("https://openalex.org/T10001"), DisplayName: testPtr("Machine Learning"),
+			Subfield: &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/subfields/1702"), DisplayName: testPtr("Artificial Intelligence")},
+			Field:    &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/fields/17"), DisplayName: testPtr("Computer Science")},
+			Domain:   &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/domains/1"), DisplayName: testPtr("Physical Sciences")}},
+		{ID: testPtr("https://openalex.org/T10002"), DisplayName: testPtr("Databases"),
+			Subfield: &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/subfields/1703"), DisplayName: testPtr("Databases")},
+			Field:    &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/fields/17"), DisplayName: testPtr("Computer Science")}},
+		{ID: testPtr("https://openalex.org/T10003"), DisplayName: testPtr("Compilers"),
+			Subfield: &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/subfields/1704"), DisplayName: testPtr("Compilers")},
+			Field:    &normalizer.ParquetNamedRef{ID: testPtr("https://openalex.org/fields/17"), DisplayName: testPtr("Computer Science")}},
 	})
 	instBytes := buildParquetBytes(t, []normalizer.ParquetInstitution{
 		{ID: testPtr("https://openalex.org/I1"), DisplayName: testPtr("MIT"), CountryCode: testPtr("us")},

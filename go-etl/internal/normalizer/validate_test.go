@@ -117,9 +117,9 @@ func TestPrepareJSONRules(t *testing.T) {
 		return &JSONWork{
 			ID:              "https://openalex.org/W2002",
 			Type:            "preprint",
-			UpdatedDate:     "2026-10-14T12:00:00.000000",
+			UpdatedDate:     ptr("2026-10-14T12:00:00.000000"),
 			IsRetracted:     ptr(false),
-			PublicationYear: 2024,
+			PublicationYear: ptr(int32(2024)),
 			PrimaryTopic: &JSONPrimaryTopic{
 				ID:    "https://openalex.org/T10001",
 				Field: &JSONIDRef{ID: "https://openalex.org/fields/17"},
@@ -132,7 +132,7 @@ func TestPrepareJSONRules(t *testing.T) {
 	}
 
 	noUpdated := valid()
-	noUpdated.UpdatedDate = ""
+	noUpdated.UpdatedDate = nil
 	if reason := n.PrepareJSON(noUpdated); reason != RejectBadUpdatedDate {
 		t.Fatalf("missing updated_date: %q", reason)
 	}
@@ -143,15 +143,22 @@ func TestPrepareJSONRules(t *testing.T) {
 		t.Fatalf("missing is_retracted: %q", reason)
 	}
 
-	// Year comes from the date when the scalar is absent.
+	// Year comes from the date when the scalar is absent or null.
 	fromDate := valid()
-	fromDate.PublicationYear = 0
-	fromDate.PublicationDate = "2023-11-20"
+	fromDate.PublicationYear = nil
+	fromDate.PublicationDate = ptr("2023-11-20")
 	if reason := n.PrepareJSON(fromDate); reason != "" {
 		t.Fatalf("derivable year rejected: %q", reason)
 	}
-	if fromDate.PublicationYear != 2023 {
-		t.Fatalf("derived year = %d, want 2023", fromDate.PublicationYear)
+	if fromDate.PublicationYear == nil || *fromDate.PublicationYear != 2023 {
+		t.Fatalf("derived year = %v, want 2023", fromDate.PublicationYear)
+	}
+
+	// An explicitly passed zero is invalid, not "missing".
+	explicitZero := valid()
+	explicitZero.PublicationYear = ptr(int32(0))
+	if reason := n.PrepareJSON(explicitZero); reason != RejectBadYear {
+		t.Fatalf("explicit zero year: %q, want %q", reason, RejectBadYear)
 	}
 }
 

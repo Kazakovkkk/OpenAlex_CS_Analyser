@@ -4,34 +4,17 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
-func (s *Store) ClearCheckpoints(ctx context.Context) error {
-	if err := s.conn.Exec(ctx, "TRUNCATE TABLE "+s.table("etl_checkpoints")); err != nil {
-		return fmt.Errorf("pipeline: clear checkpoints: %w", err)
-	}
-	return nil
-}
-
-// ResetCorpus drops the data and the ledger before a confirmed restart. The
-// published version is left alone, so analytics keeps reading the old release
-// until the reload publishes again.
-func (s *Store) ResetCorpus(ctx context.Context) error {
-	for _, name := range []string{"works", "dim_topics", "etl_checkpoints"} {
-		if err := s.conn.Exec(ctx, "TRUNCATE TABLE "+s.table(name)); err != nil {
-			return fmt.Errorf("pipeline: truncate %s: %w", name, err)
-		}
-	}
-	return nil
-}
-
 type CheckpointStore struct {
-	conn     Conn
+	conn     driver.Conn
 	database string
 	now      func() time.Time
 }
 
-func NewCheckpointStore(conn Conn, database string) (*CheckpointStore, error) {
+func NewCheckpointStore(conn driver.Conn, database string) (*CheckpointStore, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("pipeline: nil connection for checkpoints")
 	}
@@ -64,6 +47,19 @@ func (c *CheckpointStore) Load(ctx context.Context, entity string) (map[string]s
 		return nil, fmt.Errorf("pipeline: iterate checkpoints: %w", err)
 	}
 	return done, nil
+}
+
+// Has re-reads one checkpoint from the ledger. A writer calls it when it is not
+// sure the mark was acknowledged.
+func (c *CheckpointStore) Has(ctx context.Context, entity, objectKey string) (bool, error) {
+	var n uint64
+	err := c.conn.QueryRow(ctx,
+		"SELECT count() FROM "+c.table()+" FINAL WHERE entity = ? AND object_key = ?",
+		entity, objectKey).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("pipeline: read checkpoint %s/%s: %w", entity, objectKey, err)
+	}
+	return n > 0, nil
 }
 
 func (c *CheckpointStore) MarkDone(ctx context.Context, entity, objectKey string) error {

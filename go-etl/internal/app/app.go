@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,6 +45,14 @@ type Config struct {
 	DefaultBatchSize int
 	FullGetThreshold int64
 
+	// TestTarget marks a dedicated database where diagnostic runs may write.
+	TestTarget bool
+	TargetHost string
+	TargetPort int
+
+	LoadtestSink sink.BatchSink
+	Keys         *api.KeyStore
+
 	APIKey string
 }
 
@@ -68,6 +77,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Offers == nil {
 		c.Offers = pipeline.NewOffers(30 * time.Minute)
+	}
+	if c.Keys == nil {
+		c.Keys = api.NewKeyStore()
 	}
 	return c
 }
@@ -108,66 +120,82 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 	if a.cfg.S3 == nil {
 		return errors.New("app: s3 client is not configured")
 	}
-	manifest, err := a.cfg.S3.FetchManifest(ctx, s3.ParquetManifestKey("works"))
-	if err != nil {
-		return fmt.Errorf("app: fetch works manifest: %w", err)
+	if diagnosticRun(req) {
+		return a.runDiagnosticS3(ctx, j, req)
 	}
-	entries, err := manifest.SelectEntries(req.ShardIndex, req.ShardTotal, 0)
-	if err != nil {
-		return fmt.Errorf("app: select files: %w", err)
+	if a.cfg.Pipeline == nil {
+		return errors.New("app: working ingest requires ClickHouse state (use --dry-run for a diagnostic run)")
 	}
-	if req.FromDate != "" {
-		before := len(entries)
-		entries, err = ingest.FilterByPartitionDate(entries, req.FromDate)
-		if err != nil {
-			return err
-		}
-		a.logger.Info("ingest: date filter applied", "from_date", req.FromDate,
-			"files_before", before, "files_after", len(entries))
-		if len(entries) == 0 {
-			return fmt.Errorf("app: no files with updated_date >= %s (snapshot keeps only recent partitions)", req.FromDate)
-		}
-	}
-	diagnostic := diagnosticRun(req)
-	usePipeline := a.cfg.Pipeline != nil && !diagnostic
 
-	var (
-		publishedSnap *time.Time
-		pubManifest   string
-	)
-	if usePipeline {
-		cur, rerr := a.cfg.Pipeline.Read(ctx)
-		if rerr != nil {
-			return fmt.Errorf("app: read state: %w", rerr)
+	// The state always comes first: an unfinished load must be resumed or
+	// reported as a confirmed snapshot change before a new plan is built.
+	st, err := a.cfg.Pipeline.Read(ctx)
+	if err != nil {
+		return fmt.Errorf("app: read state: %w", err)
+	}
+	rel, err := LoadRelease(ctx, a.cfg.S3)
+	if err != nil {
+		return err
+	}
+
+	// A crashed reset is recovered before the plan: repeat all three clears and
+	// move to loading/full on the same release.
+	if st.Loading() && st.Phase == pipeline.PhaseResetting {
+		if st.ManifestID != rel.ID {
+			return a.snapshotChanged(ctx, j, st, rel)
 		}
-		if cur.LoadState == pipeline.LoadLoading && cur.InstanceID != a.cfg.InstanceID {
-			return fmt.Errorf("app: a load is already running in instance %q", cur.InstanceID)
+		snapDate := rel.Date
+		if st.LoadingSnapshotDate != nil {
+			snapDate = *st.LoadingSnapshotDate
 		}
-		if cur.Published() {
-			publishedSnap = cur.SnapshotDate
-			pubManifest = cur.ManifestID
+		if _, rerr := a.cfg.Pipeline.Restart(ctx, pipeline.RestartParams{
+			InstanceID:   a.cfg.InstanceID,
+			JobID:        j.ID(),
+			ManifestID:   rel.ID,
+			SnapshotDate: snapDate,
+		}); rerr != nil {
+			return fmt.Errorf("app: recover resetting: %w", rerr)
+		}
+		if st, err = a.cfg.Pipeline.Read(ctx); err != nil {
+			return fmt.Errorf("app: read state after reset recovery: %w", err)
 		}
 	}
-	if publishedSnap != nil {
-		from := ingest.UpdateFrom(*publishedSnap).Format("2006-01-02")
-		before := len(entries)
-		entries, err = ingest.FilterByPartitionDate(entries, from)
-		if err != nil {
-			return err
-		}
-		a.logger.Info("ingest: incremental selection",
-			"published_snapshot", publishedSnap.Format("2006-01-02"),
-			"from_partition", from, "files_before", before, "files_after", len(entries))
-		if len(entries) == 0 {
-			a.logger.Info("ingest: nothing to update", "job", j.ID(),
-				"published_snapshot", publishedSnap.Format("2006-01-02"))
+
+	resume := st.Loading() && st.ManifestID == rel.ID
+	if st.Loading() && !resume {
+		return a.snapshotChanged(ctx, j, st, rel)
+	}
+
+	lastIdle, idleErr := a.cfg.Pipeline.LastIdle(ctx)
+	hasIdle := idleErr == nil && lastIdle.Published()
+	if idleErr != nil && !errors.Is(idleErr, sql.ErrNoRows) {
+		return fmt.Errorf("app: read published state: %w", idleErr)
+	}
+
+	var published *time.Time
+	if hasIdle {
+		published = lastIdle.SnapshotDate
+	}
+	if st.Published() {
+		if st.ManifestID == rel.ID {
+			a.logger.Info("ingest: release is already published", "job", j.ID(),
+				"manifest_id", st.ManifestID, "snapshot_date", st.SnapshotDate)
 			return nil
 		}
+		published = st.SnapshotDate
 	}
 
-	a.logger.Info("ingest: starting", "job", j.ID(), "files", len(entries),
-		"shard", req.ShardIndex, "of", req.ShardTotal,
-		"snapshot_bytes", ingest.SelectionBytes(entries))
+	phase := pipeline.PhaseFull
+	if published != nil {
+		phase = pipeline.PhaseIncremental
+	}
+	if resume {
+		phase = st.Phase
+	}
+	plan, err := buildLoadPlan(rel, published, phase, req.ShardIndex, req.ShardTotal, req.MaxFiles)
+	if err != nil {
+		return fmt.Errorf("app: build plan: %w", err)
+	}
 
 	batchSize := req.BatchSize
 	if batchSize <= 0 {
@@ -180,9 +208,9 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 		readOpts.FullGetThreshold = a.cfg.FullGetThreshold
 	}
 
-	normOpts := []normalizer.Option{normalizer.WithSnapshotYear(manifestYear(manifest.Date))}
+	normOpts := []normalizer.Option{normalizer.WithSnapshotYear(rel.Date.Year())}
 	var knownIDs *knownids.Index
-	if usePipeline && publishedSnap != nil && a.cfg.BuildKnownIDs != nil {
+	if phase == pipeline.PhaseIncremental && a.cfg.BuildKnownIDs != nil {
 		idx, dur, ierr := a.cfg.BuildKnownIDs(ctx)
 		if ierr != nil {
 			return fmt.Errorf("app: build known ids: %w", ierr)
@@ -194,6 +222,169 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 		normOpts = append(normOpts, normalizer.WithKnownWork(idx.Contains))
 	}
 
+	a.logger.Info("ingest: starting", "job", j.ID(),
+		"phase", phase, "release", rel.ID, "snapshot_date", rel.DateString(),
+		"works_files", len(plan.Works), "topics_files", len(plan.Topics),
+		"works_bytes", ingest.SelectionBytes(plan.Works), "topics_bytes", ingest.SelectionBytes(plan.Topics),
+		"published_snapshot", published, "shard", req.ShardIndex, "of", req.ShardTotal)
+
+	if _, berr := a.cfg.Pipeline.BeginLoad(ctx, pipeline.BeginParams{
+		InstanceID:   a.cfg.InstanceID,
+		JobID:        j.ID(),
+		ManifestID:   rel.ID,
+		SnapshotDate: rel.Date,
+		Phase:        phase,
+	}); berr != nil {
+		return fmt.Errorf("app: begin load: %w", berr)
+	}
+
+	pool := sink.NewWorksBatchPool(batchSize, sink.DefaultMaxPooledCap)
+	files, skipped, ferr := a.corpusFiles(ctx, plan)
+	if ferr != nil {
+		return ferr
+	}
+	if skipped > 0 {
+		a.logger.Info("ingest: resuming from confirmed checkpoints", "job", j.ID(), "files_skipped", skipped)
+	}
+	writer, werr := ingest.NewWriter(ingest.WriterOptions{
+		Sink:            a.cfg.Sink,
+		Checkpoints:     a.checkpointLedger(),
+		KnownIDs:        knownIDAdder(knownIDs),
+		Metrics:         j.Metrics(),
+		Pool:            pool,
+		WorksBatchSize:  batchSize,
+		TopicsBatchSize: 5_000,
+		Logger:          a.logger,
+	})
+	if werr != nil {
+		return werr
+	}
+	res, rerr := ingest.RunWriterJob(ctx, ingest.WriterJobOptions{
+		Client:          a.cfg.S3,
+		Normalizer:      normalizer.NewNormalizer(nil, normOpts...),
+		Pool:            pool,
+		ReadOptions:     readOpts,
+		Workers:         a.cfg.DefaultWorkers,
+		AttemptsPerFile: 2,
+		Files:           files,
+		Writer:          writer,
+		Metrics:         j.Metrics(),
+		Logger:          a.logger,
+	})
+	a.logIngestResult(j, res)
+	if rerr != nil {
+		return rerr
+	}
+	if res.Stopped {
+		return nil
+	}
+	if len(plan.Topics) > 0 && res.TopicsWritten == 0 {
+		return fmt.Errorf("%w: the required Topics dictionary is empty", pipeline.ErrCorpusIncomplete)
+	}
+	if err := a.verifyRequiredCheckpoints(ctx, plan); err != nil {
+		return err
+	}
+
+	if plan.Deletions {
+		if derr := a.applyDeletions(ctx, j, plan.PublishedAt, knownIDs); derr != nil {
+			return fmt.Errorf("app: deletions: %w", derr)
+		}
+	}
+	if serr := a.checkReleaseStable(ctx, j, rel); serr != nil {
+		return serr
+	}
+
+	publishedState, perr := a.cfg.Pipeline.Publish(ctx, pipeline.PublishParams{
+		InstanceID:   a.cfg.InstanceID,
+		JobID:        j.ID(),
+		ManifestID:   rel.ID,
+		SnapshotDate: rel.Date,
+		Bump:         true,
+		Now:          time.Now(),
+	})
+	if perr != nil {
+		return fmt.Errorf("app: publish: %w", perr)
+	}
+	a.logger.Info("ingest: published",
+		"job", j.ID(), "data_version", publishedState.DataVersion,
+		"snapshot_date", publishedState.SnapshotDate, "manifest_id", publishedState.ManifestID,
+		"works_written", res.WorksWritten, "topics_written", res.TopicsWritten,
+		"dedup_dropped", res.DedupDropped, "batches", res.BatchesWritten)
+	return nil
+}
+
+func (a *App) checkpointLedger() ingest.CheckpointLedger {
+	if a.cfg.Checkpoints == nil {
+		return nil
+	}
+	return a.cfg.Checkpoints
+}
+
+func knownIDAdder(idx *knownids.Index) func(uint64) {
+	if idx == nil {
+		return nil
+	}
+	return idx.Add
+}
+
+// corpusFiles filters files whose checkpoints are already confirmed, so a
+// resumed attempt does not reread them. The checkpoint counts still include
+// those files for the final completeness check.
+func (a *App) corpusFiles(ctx context.Context, plan *loadPlan) ([]ingest.JobFile, int, error) {
+	doneWorks := map[string]struct{}{}
+	doneTopics := map[string]struct{}{}
+	if a.cfg.Checkpoints != nil {
+		var err error
+		doneWorks, err = a.cfg.Checkpoints.Load(ctx, "works")
+		if err != nil {
+			return nil, 0, fmt.Errorf("app: load works checkpoints: %w", err)
+		}
+		doneTopics, err = a.cfg.Checkpoints.Load(ctx, "topics")
+		if err != nil {
+			return nil, 0, fmt.Errorf("app: load topics checkpoints: %w", err)
+		}
+	}
+	files := make([]ingest.JobFile, 0, len(plan.Works)+len(plan.Topics))
+	skipped := 0
+	for _, e := range plan.Works {
+		if _, ok := doneWorks[e.URL]; ok {
+			skipped++
+			continue
+		}
+		files = append(files, ingest.JobFile{Entity: ingest.EntityWorks, Entry: e})
+	}
+	for _, e := range plan.Topics {
+		if _, ok := doneTopics[e.URL]; ok {
+			skipped++
+			continue
+		}
+		files = append(files, ingest.JobFile{Entity: ingest.EntityTopics, Entry: e})
+	}
+	return files, skipped, nil
+}
+
+func (a *App) verifyRequiredCheckpoints(ctx context.Context, plan *loadPlan) error {
+	if a.cfg.Checkpoints == nil {
+		return nil
+	}
+	for entity, files := range map[string][]ingest.Entry{"works": plan.Works, "topics": plan.Topics} {
+		n, err := a.cfg.Checkpoints.Count(ctx, entity)
+		if err != nil {
+			return fmt.Errorf("app: count %s checkpoints: %w", entity, err)
+		}
+		if n < uint64(len(files)) {
+			return fmt.Errorf("%w: %d of %d %s checkpoint(s) confirmed",
+				pipeline.ErrCorpusIncomplete, n, len(files), entity)
+		}
+	}
+	return nil
+}
+
+func (a *App) runWorks(ctx context.Context, j *jobs.Job, entries []ingest.Entry, batchSize int,
+	readOpts s3.ParquetReadOptions, normOpts []normalizer.Option) (ingest.Result, error) {
+	if len(entries) == 0 {
+		return ingest.Result{JobID: j.ID()}, nil
+	}
 	proc := &ingest.S3WorksProcessor{
 		Client:      a.cfg.S3,
 		Normalizer:  normalizer.NewNormalizer(normalizer.NewWorkDeduplicator(), normOpts...),
@@ -202,106 +393,203 @@ func (a *App) runIngestS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRe
 		Metrics:     j.Metrics(),
 		ReadOptions: readOpts,
 	}
+	opts := ingest.Options{
+		Workers:         a.cfg.DefaultWorkers,
+		AttemptsPerFile: 2,
+		Order:           ingest.OrderBalanced,
+		JobID:           j.ID(),
+		Metrics:         j.Metrics(),
+		Logger:          a.logger,
+	}
+	if a.cfg.Checkpoints != nil {
+		opts.Checkpoints = clickhouseLedger{ctx: ctx, store: a.cfg.Checkpoints, entity: "works"}
+	}
+	res, err := ingest.Run(ctx, entries, proc, opts)
+	a.logIngestResult(j, res)
+	return res, err
+}
 
+func (a *App) runTopics(ctx context.Context, j *jobs.Job, entries []ingest.Entry,
+	readOpts s3.ParquetReadOptions) (ingest.Result, error) {
+	if len(entries) == 0 {
+		return ingest.Result{JobID: j.ID()}, nil
+	}
+	proc := &ingest.S3TopicsProcessor{
+		Client:      a.cfg.S3,
+		Sink:        a.cfg.Sink,
+		Metrics:     j.Metrics(),
+		ReadOptions: readOpts,
+	}
+	opts := ingest.Options{
+		Workers:         a.cfg.DefaultWorkers,
+		AttemptsPerFile: 2,
+		Order:           ingest.OrderManifest,
+		JobID:           j.ID(),
+		Metrics:         j.Metrics(),
+		Logger:          a.logger,
+	}
+	if a.cfg.Checkpoints != nil {
+		opts.Checkpoints = clickhouseLedger{ctx: ctx, store: a.cfg.Checkpoints, entity: "topics"}
+	}
+	res, err := ingest.Run(ctx, entries, proc, opts)
+	if err != nil {
+		return res, fmt.Errorf("app: topics: %w", err)
+	}
+	a.logger.Info("ingest: topics finished", "job", j.ID(),
+		"files_done", res.FilesDone, "files_failed", res.FilesFailed,
+		"written", res.Written, "bytes_read", res.BytesRead)
+	return res, nil
+}
+
+// runDiagnosticS3 is the isolated path for limits, an arbitrary S3 lower bound
+// and a separate shard: no pipeline rows, no checkpoints, and a ClickHouse
+// sink only when the config marks a dedicated test target.
+func (a *App) runDiagnosticS3(ctx context.Context, j *jobs.Job, req httpapi.IngestRequest) error {
+	if _, isClickHouse := a.cfg.Sink.(*sink.ClickHouseSink); isClickHouse && !a.cfg.TestTarget {
+		return errors.New("app: diagnostic run would write the working corpus; use --dry-run or a dedicated test target")
+	}
+	manifest, err := a.cfg.S3.FetchManifest(ctx, s3.ParquetManifestKey("works"))
+	if err != nil {
+		return fmt.Errorf("app: fetch works manifest: %w", err)
+	}
+	if err := manifest.Validate("works"); err != nil {
+		return err
+	}
+	entries, err := manifest.SelectEntries(req.ShardIndex, req.ShardTotal, req.MaxFiles)
+	if err != nil {
+		return fmt.Errorf("app: select files: %w", err)
+	}
+	if req.FromDate != "" {
+		before := len(entries)
+		entries, err = ingest.FilterByPartitionDate(entries, req.FromDate)
+		if err != nil {
+			return err
+		}
+		a.logger.Info("ingest: date filter applied", "from_date", req.FromDate,
+			"files_before", before, "files_after", len(entries))
+		if len(entries) == 0 {
+			return fmt.Errorf("app: no files with updated_date >= %s", req.FromDate)
+		}
+	}
+	batchSize := req.BatchSize
+	if batchSize <= 0 {
+		batchSize = a.cfg.DefaultBatchSize
+	}
+	readOpts := s3.DefaultParquetReadOptions()
+	readOpts.BatchSize = batchSize
+	readOpts.Metrics = j.Metrics()
+	if a.cfg.FullGetThreshold > 0 {
+		readOpts.FullGetThreshold = a.cfg.FullGetThreshold
+	}
+	normOpts := []normalizer.Option{normalizer.WithSnapshotYear(manifestYear(manifest.Date))}
+	proc := &ingest.S3WorksProcessor{
+		Client:      a.cfg.S3,
+		Normalizer:  normalizer.NewNormalizer(normalizer.NewWorkDeduplicator(), normOpts...),
+		Pool:        sink.NewWorksBatchPool(batchSize, sink.DefaultMaxPooledCap),
+		Sink:        a.cfg.Sink,
+		Metrics:     j.Metrics(),
+		ReadOptions: readOpts,
+	}
 	workers := req.Workers
 	if workers <= 0 {
 		workers = a.cfg.DefaultWorkers
 	}
-
-	var (
-		manifestID string
-		snapDate   time.Time
-	)
-	if usePipeline {
-		manifestID = a.manifestID(ctx, manifest)
-		parsed, perr := time.Parse("2006-01-02", strings.TrimSpace(manifest.Date))
-		if perr != nil {
-			return fmt.Errorf("app: manifest date %q: %w", manifest.Date, perr)
-		}
-		snapDate = parsed
-		if _, berr := a.cfg.Pipeline.BeginLoad(ctx, pipeline.BeginParams{
-			InstanceID:   a.cfg.InstanceID,
-			JobID:        j.ID(),
-			ManifestID:   manifestID,
-			SnapshotDate: snapDate,
-		}); berr != nil {
-			return fmt.Errorf("app: begin load: %w", berr)
-		}
+	journal, jerr := newProgressJournal(req)
+	if jerr != nil {
+		return jerr
 	}
-
-	var (
-		ledger ingest.Ledger
-		ckPath string
-	)
-	switch {
-	case diagnostic:
-	case a.cfg.Checkpoints != nil:
-		ledger = clickhouseLedger{ctx: ctx, store: a.cfg.Checkpoints}
-	case a.cfg.CheckpointDir != "":
-		ckPath = filepath.Join(a.cfg.CheckpointDir, fmt.Sprintf(
-			"works-%s-shard%d-of%d-max%d.jsonl", req.Source, req.ShardIndex, req.ShardTotal, req.MaxFiles))
-	}
-
+	defer journal.Close()
 	res, err := ingest.Run(ctx, entries, proc, ingest.Options{
 		Workers:         workers,
-		MaxFiles:        req.MaxFiles,
 		AttemptsPerFile: 2,
 		Order:           ingest.OrderBalanced,
-		CheckpointPath:  ckPath,
-		Checkpoints:     ledger,
 		JobID:           j.ID(),
 		Metrics:         j.Metrics(),
 		Logger:          a.logger,
 		MaxRecords:      int64(req.MaxRecords),
 	})
+	journal.Write(res)
 	a.logIngestResult(j, res)
 	if err != nil {
 		return err
 	}
-	if res.Stopped {
-		return nil
-	}
 	if res.FilesFailed > 0 {
-		// A failed file means the corpus is not complete: the version must not be
-		// published, and the state stays `loading` for the next attempt.
-		return fmt.Errorf("%w: %d of %d file(s) failed, nothing was published",
-			pipeline.ErrCorpusIncomplete, res.FilesFailed, res.FilesDone+res.FilesFailed)
-	}
-	if !usePipeline && ledger == nil && res.FilesDone == 0 && res.FilesSkipped > 0 {
-		return fmt.Errorf("app: all %d selected file(s) were already processed according to checkpoint %q; "+
-			"delete that file (or change max_files/shard) to run them again", res.FilesSkipped, ckPath)
-	}
-	if usePipeline {
-		if derr := a.applyDeletions(ctx, j, publishedSnap, knownIDs); derr != nil {
-			return fmt.Errorf("app: deletions: %w", derr)
-		}
-		if serr := a.checkManifestStable(ctx, manifest, pubManifest, j); serr != nil {
-			return serr
-		}
-		published, perr := a.cfg.Pipeline.Publish(ctx, pipeline.PublishParams{
-			InstanceID:   a.cfg.InstanceID,
-			JobID:        j.ID(),
-			ManifestID:   manifestID,
-			SnapshotDate: snapDate,
-			DataChanged:  publishDataChanged(res),
-			Now:          time.Now(),
-		})
-		if perr != nil {
-			return fmt.Errorf("app: publish: %w", perr)
-		}
-		a.logger.Info("ingest: published",
-			"job", j.ID(), "data_version", published.DataVersion,
-			"snapshot_date", published.SnapshotDate, "manifest_id", published.ManifestID)
+		return fmt.Errorf("app: diagnostic run failed %d file(s)", res.FilesFailed)
 	}
 	return nil
 }
 
+func (a *App) snapshotChanged(ctx context.Context, j *jobs.Job, st pipeline.State, rel *Release) error {
+	var previous *time.Time
+	if lastIdle, err := a.cfg.Pipeline.LastIdle(ctx); err == nil {
+		previous = lastIdle.SnapshotDate
+	}
+	available := rel.Date
+	offer := a.cfg.Offers.Issue(pipeline.Offer{
+		PreviousManifest:      st.ManifestID,
+		NewManifest:           rel.ID,
+		Database:              a.cfg.Pipeline.Database(),
+		Revision:              st.Revision,
+		JobID:                 j.ID(),
+		PreviousSnapshotDate:  previous,
+		AvailableSnapshotDate: &available,
+		TargetDatabase: pipeline.TargetDatabase{
+			Host:     a.cfg.TargetHost,
+			Port:     a.cfg.TargetPort,
+			Database: a.cfg.Pipeline.Database(),
+		},
+	})
+	a.logger.Warn("ingest: the unfinished snapshot is gone, publication refused",
+		"job", j.ID(), "previous", st.ManifestID, "available", rel.ID)
+	return &pipeline.SnapshotChangedError{
+		Token:                 offer.Token,
+		PreviousManifest:      st.ManifestID,
+		CurrentManifest:       rel.ID,
+		PreviousSnapshotDate:  previous,
+		AvailableSnapshotDate: &available,
+		TargetDatabase:        offer.TargetDatabase,
+	}
+}
+
+// checkReleaseStable re-reads both mandatory manifests before publication and
+// refuses to publish if the release changed while the load was running.
+func (a *App) checkReleaseStable(ctx context.Context, j *jobs.Job, started *Release) error {
+	cur, err := LoadRelease(ctx, a.cfg.S3)
+	if err != nil {
+		// An unavailable mandatory manifest must block publication.
+		return fmt.Errorf("app: final release check: %w", err)
+	}
+	if cur.ID == started.ID {
+		return nil
+	}
+	var st pipeline.State
+	if got, rerr := a.cfg.Pipeline.Read(ctx); rerr == nil {
+		st = got
+	}
+	snap := pipeline.State{ManifestID: started.ID, Revision: st.Revision, SnapshotDate: &started.Date}
+	return a.snapshotChanged(ctx, j, snap, cur)
+}
+
 func diagnosticRun(req httpapi.IngestRequest) bool {
-	return req.MaxFiles > 0 || req.MaxRecords > 0 || req.ShardTotal > 1
+	return req.MaxFiles > 0 || req.MaxRecords > 0 || req.ShardTotal > 1 || req.FromDate != ""
 }
 
 func publishDataChanged(res ingest.Result) bool {
 	return res.Written > 0 || res.FilesDone > 0
+}
+
+func loadPhase(published *time.Time) pipeline.LoadPhase {
+	if published != nil {
+		return pipeline.PhaseIncremental
+	}
+	return pipeline.PhaseFull
+}
+
+func dimensionsPhase(cur pipeline.State) pipeline.LoadPhase {
+	if cur.Published() {
+		return pipeline.PhaseIncremental
+	}
+	return pipeline.PhaseFull
 }
 
 func (a *App) manifestID(ctx context.Context, works *s3.Manifest) string {
@@ -315,16 +603,17 @@ func (a *App) manifestID(ctx context.Context, works *s3.Manifest) string {
 }
 
 type clickhouseLedger struct {
-	ctx   context.Context
-	store *pipeline.CheckpointStore
+	ctx    context.Context
+	store  *pipeline.CheckpointStore
+	entity string
 }
 
 func (l clickhouseLedger) LoadDone() (map[string]struct{}, error) {
-	return l.store.Load(l.ctx, "works")
+	return l.store.Load(l.ctx, l.entity)
 }
 
 func (l clickhouseLedger) MarkDone(objectKey string) error {
-	return l.store.MarkDone(l.ctx, "works", objectKey)
+	return l.store.MarkDone(l.ctx, l.entity, objectKey)
 }
 
 // checkManifestStable re-reads the release manifest and refuses to publish if it
@@ -376,19 +665,38 @@ func (a *App) RestartIngest(ctx context.Context, j *jobs.Job, req httpapi.Restar
 	if terr != nil {
 		return terr
 	}
-	cur, merr := a.cfg.S3.FetchManifest(ctx, s3.ParquetManifestKey("works"))
+	rel, merr := LoadRelease(ctx, a.cfg.S3)
 	if merr != nil {
-		return fmt.Errorf("app: manifest: %w", merr)
+		return fmt.Errorf("app: release: %w", merr)
 	}
-	if cur.CanonicalID() != offer.NewManifest {
+	if rel.ID != offer.NewManifest {
 		return fmt.Errorf("%w: the release changed again", pipeline.ErrRestartOfferExpired)
 	}
-	if rerr := a.cfg.Pipeline.ResetCorpus(ctx); rerr != nil {
+	if _, rerr := a.cfg.Pipeline.Restart(ctx, pipeline.RestartParams{
+		InstanceID:   a.cfg.InstanceID,
+		JobID:        j.ID(),
+		ManifestID:   rel.ID,
+		SnapshotDate: rel.Date,
+	}); rerr != nil {
 		return rerr
 	}
 	a.logger.Warn("ingest: restart confirmed, corpus cleared",
 		"job", j.ID(), "manifest", offer.NewManifest, "previous", offer.PreviousManifest)
 	return a.runIngestS3(ctx, j, httpapi.IngestRequest{Source: "s3", ShardTotal: 1})
+}
+
+// PreviewRestart validates a restart token without consuming it, so the HTTP
+// layer can answer 409 restart_offer_expired before a job is created.
+func (a *App) PreviewRestart(ctx context.Context, token string) error {
+	if a.cfg.Pipeline == nil {
+		return pipeline.ErrRestartOfferExpired
+	}
+	st, err := a.cfg.Pipeline.Read(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = a.cfg.Offers.Lookup(token, a.cfg.Pipeline.Database(), st.Revision)
+	return err
 }
 
 // applyDeletions streams the release deletion log, keeps ids we actually store
@@ -402,6 +710,9 @@ func (a *App) applyDeletions(ctx context.Context, j *jobs.Job, since *time.Time,
 		cand    int64
 		deleted int64
 	)
+	if j != nil {
+		j.Metrics().SetCurrentItem("deletions")
+	}
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -453,6 +764,9 @@ func (a *App) runIngestAPI(ctx context.Context, j *jobs.Job, req httpapi.IngestR
 	apiKey := ResolveAPIKey(req.APIKey)
 	if apiKey == "" {
 		apiKey = a.cfg.APIKey
+	}
+	if apiKey == "" {
+		apiKey = a.cfg.Keys.Get()
 	}
 	client := api.NewClient(api.Options{
 		APIKey:   apiKey,
@@ -600,6 +914,7 @@ func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.Dimens
 			JobID:        j.ID(),
 			ManifestID:   manifestID,
 			SnapshotDate: snapDate,
+			Phase:        dimensionsPhase(cur),
 		}); berr != nil {
 			return fmt.Errorf("app: begin load: %w", berr)
 		}
@@ -643,7 +958,7 @@ func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.Dimens
 			JobID:        j.ID(),
 			ManifestID:   manifestID,
 			SnapshotDate: snapDate,
-			DataChanged:  changed,
+			Bump:         changed || req.ForceReload,
 			Now:          time.Now(),
 		})
 		if perr != nil {
@@ -657,13 +972,17 @@ func (a *App) RunDimensions(ctx context.Context, j *jobs.Job, req httpapi.Dimens
 
 func (a *App) RunLoadtest(ctx context.Context, j *jobs.Job, req httpapi.LoadtestRequest) error {
 	samplePath := a.cfg.SamplePath
+	sinkForLoad := a.cfg.LoadtestSink
+	if sinkForLoad == nil {
+		sinkForLoad = a.cfg.Sink
+	}
 	res, err := loadtest.Run(ctx, loadtest.Config{
 		SamplePath:  samplePath,
 		TargetRPS:   req.TargetRPS,
 		DurationSec: req.DurationSec,
 		Workers:     req.Workers,
 		BatchSize:   req.BatchSize,
-	}, a.cfg.Sink, j.Metrics())
+	}, sinkForLoad, j.Metrics())
 	if err != nil {
 		return err
 	}
@@ -679,5 +998,12 @@ func (a *App) RequestAPIKey(ctx context.Context, email string) (api.APIKeyResult
 	if client == nil {
 		client = api.NewClient(api.Options{})
 	}
-	return client.RequestAPIKey(ctx, email)
+	res, err := client.RequestAPIKey(ctx, email)
+	if err != nil {
+		return res, err
+	}
+	// Keep the value inside Go for the next manual API job; the HTTP response
+	// carries only the status message.
+	a.cfg.Keys.Set(res.APIKey)
+	return api.APIKeyResult{Message: res.Message}, nil
 }

@@ -78,6 +78,12 @@ type FileReadResult struct {
 	DedupDropped uint64
 	// RejectedRows counts structurally unusable rows of this file (MVP Task 1).
 	RejectedRows uint64
+	// RejectedByReason is applied to the job metrics only when the file
+	// completes, so a retried file does not inflate rejected_records.
+	RejectedByReason map[string]uint64
+	// RestoredYears counts rows whose publication_year was recovered from a
+	// usable publication_date.
+	RestoredYears uint64
 	// Truncated is true when MaxRecords stopped the file before its end.
 	Truncated    bool
 	BytesRead    uint64
@@ -241,17 +247,22 @@ func ProcessWorksFile(
 		rows:
 			for i := range n {
 				row := &rowBuf[i]
-				// Corpus gate first (cheap), then structural validation: a
-				// non-CS record must not inflate the rejected counter.
-				if !normalizer.IsCSParquetWork(row) {
+				// Known works are written even when they leave the corpus; a new
+				// non-CS row is filtered without touching rejected_records.
+				if !norm.WantsParquet(row) {
 					continue
 				}
+				yearMissing := row.PublicationYear == nil
 				if reason := norm.PrepareParquet(row); reason != "" {
 					batchRejected++
-					if opts.Metrics != nil {
-						opts.Metrics.AddRejected(string(reason))
+					if res.RejectedByReason == nil {
+						res.RejectedByReason = make(map[string]uint64, 4)
 					}
+					res.RejectedByReason[string(reason)]++
 					continue
+				}
+				if yearMissing && row.PublicationYear != nil {
+					res.RestoredYears++
 				}
 				outcome := norm.AppendParquetWork(row, batch)
 				switch outcome {
@@ -434,6 +445,13 @@ func ProcessTopicsFile(
 			return res, err
 		}
 		res.WrittenRows += written
+	}
+
+	// When the manifest gives record_count, the file must actually contain that
+	// many rows; a short read means the dictionary is incomplete.
+	if entry.Meta.RecordCount > 0 && res.ScannedRows != uint64(entry.Meta.RecordCount) {
+		return res, fmt.Errorf("topics file %s: scanned %d row(s), manifest record_count is %d",
+			entry.URL, res.ScannedRows, entry.Meta.RecordCount)
 	}
 
 	applyRangeStats(&res, statsFn())

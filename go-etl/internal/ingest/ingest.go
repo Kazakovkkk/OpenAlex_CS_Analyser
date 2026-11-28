@@ -98,8 +98,13 @@ type Result struct {
 	Scanned      uint64
 	Matched      uint64
 	Written      uint64
-	DedupDropped uint64
-	Rejected     uint64
+	// WorksWritten and TopicsWritten split Written by entity for the mandatory
+	// dictionary check before publication.
+	WorksWritten  uint64
+	TopicsWritten uint64
+	DedupDropped  uint64
+	Rejected      uint64
+	RestoredYears uint64
 
 	BytesRead    uint64
 	HTTPRequests uint64
@@ -107,8 +112,10 @@ type Result struct {
 
 	Stopped   bool
 	Truncated bool
-	Elapsed   time.Duration
-	LastDone  string
+	// BatchesWritten counts acknowledged INSERTs of the single writer.
+	BatchesWritten uint64
+	Elapsed        time.Duration
+	LastDone       string
 }
 
 func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Result, error) {
@@ -206,6 +213,12 @@ func Run(ctx context.Context, entries []Entry, p Processor, opts Options) (Resul
 		res.Written += r.WrittenRows
 		res.DedupDropped += r.DedupDropped
 		res.Rejected += r.RejectedRows
+		res.RestoredYears += r.RestoredYears
+		if opts.Metrics != nil {
+			for reason, n := range r.RejectedByReason {
+				opts.Metrics.AddRejectedN(reason, n)
+			}
+		}
 		res.BytesRead += r.BytesRead
 		res.HTTPRequests += r.HTTPRequests
 		res.PlanBytes += r.PrefetchPlanBytes
@@ -318,7 +331,8 @@ feed:
 	logger.Info("ingest: run finished",
 		"job", res.JobID, "done", res.FilesDone, "failed", res.FilesFailed,
 		"skipped", res.FilesSkipped, "stopped", res.Stopped,
-		"rejected", res.Rejected, "elapsed", res.Elapsed.Round(time.Millisecond))
+		"rejected", res.Rejected, "restored_years", res.RestoredYears,
+		"elapsed", res.Elapsed.Round(time.Millisecond))
 	return res, nil
 }
 

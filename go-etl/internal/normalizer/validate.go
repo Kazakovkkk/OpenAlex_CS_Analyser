@@ -66,6 +66,10 @@ func (n *Normalizer) PrepareParquet(w *ParquetWork) RejectReason {
 	if strings.TrimSpace(derefString(w.Type)) == "" {
 		return RejectBadType
 	}
+	if w.PublicationYear != nil && *w.PublicationYear <= 0 {
+		// An explicit zero/negative year is not "missing": it is invalid.
+		return RejectBadYear
+	}
 
 	year, reason := n.resolveParquetYear(w)
 	if reason != "" {
@@ -96,7 +100,7 @@ func (n *Normalizer) PrepareJSON(w *JSONWork) RejectReason {
 	if workID == 0 {
 		return RejectBadWorkID
 	}
-	if _, ok := ParseUpdatedDate(w.UpdatedDate); !ok {
+	if _, ok := ParseUpdatedDate(derefString(w.UpdatedDate)); !ok {
 		return RejectBadUpdatedDate
 	}
 	if w.IsRetracted == nil {
@@ -105,13 +109,17 @@ func (n *Normalizer) PrepareJSON(w *JSONWork) RejectReason {
 	if strings.TrimSpace(w.Type) == "" {
 		return RejectBadType
 	}
+	if w.PublicationYear != nil && *w.PublicationYear <= 0 {
+		return RejectBadYear
+	}
 
 	year, reason := n.resolveJSONYear(w)
 	if reason != "" {
 		return reason
 	}
-	if w.PublicationYear <= 0 {
-		w.PublicationYear = int32(year)
+	if w.PublicationYear == nil || *w.PublicationYear <= 0 {
+		derived := int32(year)
+		w.PublicationYear = &derived
 	}
 
 	if n.knownWork != nil && n.knownWork(workID) {
@@ -156,21 +164,21 @@ func (n *Normalizer) resolveParquetYear(w *ParquetWork) (int, RejectReason) {
 }
 
 func (n *Normalizer) resolveJSONYear(w *JSONWork) (int, RejectReason) {
-	hasField := w.PublicationYear > 0
+	hasField := w.PublicationYear != nil && *w.PublicationYear > 0
 	dateYear, hasDate := 0, false
-	if t, ok := ParseDate32String(w.PublicationDate); ok {
+	if t, ok := ParseDate32String(derefString(w.PublicationDate)); ok {
 		dateYear, hasDate = t.Year(), true
 	}
 
 	var year int
 	switch {
 	case hasField && hasDate:
-		if int(w.PublicationYear) != dateYear {
+		if int(*w.PublicationYear) != dateYear {
 			return 0, RejectYearDateMismatch
 		}
-		year = int(w.PublicationYear)
+		year = int(*w.PublicationYear)
 	case hasField:
-		year = int(w.PublicationYear)
+		year = int(*w.PublicationYear)
 	case hasDate:
 		year = dateYear
 	default:

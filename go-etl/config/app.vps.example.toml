@@ -1,0 +1,27 @@
+# Конфиг для удалённого стенда (VPS). Программа запускается локально и ходит
+# к ClickHouse на сервере по нативному TCP с TLS.
+#
+# Пароли не хранятся в файле — только имена переменных окружения:
+#
+#   export CLICKHOUSE_ETL_WRITER_PASSWORD=...
+#   export CLICKHOUSE_GO_WRITER_PASSWORD=...
+#
+# Пробный прогон (ничего не публикует и не пишет чекпоинты):
+#   go run ./cmd/etl ingest --config config/app.vps.toml --max-files 1 --max-records 100
+#
+# Полная загрузка:
+#   go run ./cmd/etl ingest --config config/app.vps.toml --workers 4 --batch-size 10000
+
+[clickhouse]
+host = "168.113.253.42"
+port = 9440
+database = "openalex"
+secure = true
+pipeline_writer_user = "pipeline_writer"
+python_pipeline_writer_password_env = "CLICKHOUSE_PYTHON_WRITER_PASSWORD"
+
+[go_etl]
+base_url = "http://127.0.0.1:8081"
+etl_writer_user = "etl_writer"
+etl_writer_password_env = "CLICKHOUSE_ETL_WRITER_PASSWORD"
+go_pipeline_writer_password_env = "CLICKHOUSE_GO_WRITER_PASSWORD"

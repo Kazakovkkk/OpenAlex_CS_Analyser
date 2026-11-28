@@ -13,16 +13,27 @@ import (
 // no longer matches the state it was issued for.
 var ErrRestartOfferExpired = errors.New("pipeline: restart offer expired or invalid")
 
+// TargetDatabase identifies the database a restart offer belongs to.
+type TargetDatabase struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Database string `json:"database"`
+}
+
 // SnapshotChangedError tells the caller that the release changed while loading;
 // the load must not publish, and restarting requires the token it carries.
 type SnapshotChangedError struct {
 	Token            string
 	PreviousManifest string
 	CurrentManifest  string
+
+	PreviousSnapshotDate  *time.Time
+	AvailableSnapshotDate *time.Time
+	TargetDatabase        TargetDatabase
 }
 
 func (e *SnapshotChangedError) Error() string {
-	return fmt.Sprintf("pipeline: snapshot changed during load (published %q, bucket %q)",
+	return fmt.Sprintf("pipeline: snapshot changed during load (published %q, available %q)",
 		e.PreviousManifest, e.CurrentManifest)
 }
 
@@ -35,6 +46,10 @@ type Offer struct {
 	Revision         uint64
 	JobID            string
 	ExpiresAt        time.Time
+
+	PreviousSnapshotDate  *time.Time
+	AvailableSnapshotDate *time.Time
+	TargetDatabase        TargetDatabase
 }
 
 type Offers struct {
@@ -67,20 +82,34 @@ func (o *Offers) Issue(in Offer) Offer {
 	return in
 }
 
+// Lookup checks a token without consuming it.
+func (o *Offers) Lookup(token, database string, revision uint64) (Offer, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.lookupLocked(token, database, revision)
+}
+
+func (o *Offers) lookupLocked(token, database string, revision uint64) (Offer, error) {
+	off, ok := o.items[token]
+	if !ok {
+		return Offer{}, ErrRestartOfferExpired
+	}
+	if o.now().After(off.ExpiresAt) || off.Database != database || off.Revision != revision {
+		return Offer{}, ErrRestartOfferExpired
+	}
+	return off, nil
+}
+
 // Take consumes a token if it is still valid for this database and revision.
 func (o *Offers) Take(token, database string, revision uint64) (Offer, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	off, ok := o.items[token]
-	if !ok {
-		return Offer{}, ErrRestartOfferExpired
+	off, err := o.lookupLocked(token, database, revision)
+	if err != nil {
+		return Offer{}, err
 	}
 	delete(o.items, token)
-
-	if o.now().After(off.ExpiresAt) || off.Database != database || off.Revision != revision {
-		return Offer{}, ErrRestartOfferExpired
-	}
 	return off, nil
 }
 

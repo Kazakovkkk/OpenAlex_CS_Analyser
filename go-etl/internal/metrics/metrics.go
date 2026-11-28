@@ -186,7 +186,16 @@ func (m *JobMetrics) AddMatched(n uint64)      { m.matchedRecords.Add(n) }
 func (m *JobMetrics) AddDedupDropped(n uint64) { m.dedupDropped.Add(n) }
 
 func (m *JobMetrics) AddRejected(reason string) {
-	m.rejectedRecords.Add(1)
+	m.AddRejectedN(reason, 1)
+}
+
+// AddRejectedN adds a whole file's rejection tally at once, so a retried file
+// is counted only when it completes.
+func (m *JobMetrics) AddRejectedN(reason string, n uint64) {
+	if n == 0 {
+		return
+	}
+	m.rejectedRecords.Add(n)
 	if reason == "" {
 		return
 	}
@@ -194,7 +203,7 @@ func (m *JobMetrics) AddRejected(reason string) {
 	if m.rejectedReasons == nil {
 		m.rejectedReasons = make(map[string]uint64, 8)
 	}
-	m.rejectedReasons[reason]++
+	m.rejectedReasons[reason] += n
 	m.rejectedMu.Unlock()
 }
 

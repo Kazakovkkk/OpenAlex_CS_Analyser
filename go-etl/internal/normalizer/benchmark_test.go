@@ -178,9 +178,9 @@ func buildSyntheticDataset(n int) *benchDataset {
 		fwci := 1.25 + float64(i%10)*0.3
 		jw := JSONWork{
 			ID:              fmt.Sprintf("https://openalex.org/W%d", 2700000000+i),
-			PublicationYear: int32(2015 + i%12),
-			PublicationDate: fmt.Sprintf("%04d-06-%02d", 2015+i%12, 1+i%28),
-			UpdatedDate:     "2026-10-14T06:19:08.300824Z",
+			PublicationYear: ptr(int32(2015 + i%12)),
+			PublicationDate: ptr(fmt.Sprintf("%04d-06-%02d", 2015+i%12, 1+i%28)),
+			UpdatedDate:     ptr("2026-10-14T06:19:08.300824Z"),
 			Type:            "article",
 			IsRetracted:     ptr(false),
 			IsXPAC:          false,
@@ -314,7 +314,7 @@ func appendAoSWork(w *JSONWork, dst []aosWork) []aosWork {
 		return dst
 	}
 	var pubDatePtr *time.Time
-	if t, ok := ParseDate32String(w.PublicationDate); ok {
+	if t, ok := ParseDate32String(derefString(w.PublicationDate)); ok {
 		dt := new(time.Time)
 		*dt = t
 		pubDatePtr = dt
@@ -344,9 +344,9 @@ func appendAoSWork(w *JSONWork, dst []aosWork) []aosWork {
 
 	return append(dst, aosWork{
 		WorkID:            ParseWorkID(w.ID),
-		PubYear:           ClampUint16(w.PublicationYear),
+		PubYear:           ClampUint16(derefInt32(w.PublicationYear)),
 		PubDate:           pubDatePtr,
-		UpdatedDate:       ParseTimestampString(w.UpdatedDate),
+		UpdatedDate:       ParseTimestampString(derefString(w.UpdatedDate)),
 		WorkType:          w.Type,
 		IsRetracted:       boolToUint8(derefBool(w.IsRetracted)),
 		FWCI:              fwciPtr,
