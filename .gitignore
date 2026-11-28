@@ -20,9 +20,7 @@ tmp/
 .DS_Store
 .idea/
 .vscode/
-
-# Reports and specs are deliverables: docs/ is tracked.
-# Only ad-hoc scratch output stays out of the repository.
+docs/
 logs/
 dist/
 *_out.txt
