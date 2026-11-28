@@ -192,6 +192,7 @@ func runServe(ctx context.Context, logger *slog.Logger, args []string) error {
 	// Close the admission of new write jobs first, then stop the active job and
 	// wait for its final flush (spec step 1.4).
 	srv.BeginShutdown()
+	manager.CloseAdmission()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("http shutdown", "err", err)
 	}

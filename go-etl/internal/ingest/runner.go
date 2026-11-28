@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	s3 "go-etl/internal/adapters/s3"
 	"go-etl/internal/metrics"
@@ -50,11 +51,14 @@ func RunWriterJob(ctx context.Context, opts WriterJobOptions) (Result, error) {
 		opts.Logger = slog.Default()
 	}
 	res := Result{}
+	res.FilesTotal = len(opts.Files)
+	started := time.Now()
 	if len(opts.Files) == 0 {
 		written, err := opts.Writer.Run(ctx, closedPortions())
 		res.Written = written.Written
 		res.DedupDropped = written.DedupDropped
 		res.FilesDone = written.FilesDone
+		res.Elapsed = time.Since(started)
 		return res, err
 	}
 
@@ -163,6 +167,7 @@ func RunWriterJob(ctx context.Context, opts WriterJobOptions) (Result, error) {
 	res.FilesFailed = len(failed)
 	res.FilesSkipped = out.result.FilesSkipped
 	res.Stopped = ctx.Err() != nil && out.err == nil
+	res.Elapsed = time.Since(started)
 	if opts.Metrics != nil {
 		for reason, n := range stats.RejectedByReason {
 			opts.Metrics.AddRejectedN(reason, n)
